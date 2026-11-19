@@ -1,6 +1,6 @@
-[![bounty](https://make.fun/api/badges/bounty/gta6-cover-art-01.svg?theme=auto)](https://make.fun/bounty/gta6-cover-art-01)
-[![leaderboard](https://make.fun/api/badges/leaderboard/gta6-cover-art-01.svg?theme=auto)](https://make.fun/bounty/gta6-cover-art-01)
-[![entries](https://make.fun/api/badges/entries/gta6-cover-art-01.svg?theme=auto)](https://make.fun/bounty/gta6-cover-art-01)
+[![make.fun · gta6-cover-art-01](https://make.fun/badge/gta6-cover-art-01.svg)](https://make.fun/bounty/gta6-cover-art-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01)
+[![rank](https://make.fun/badge/gta6-cover-art-01/bangyan37/gta6-cover-art/rank.svg)](https://make.fun/bounty/gta6-cover-art-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01)
+[![reward](https://make.fun/badge/gta6-cover-art-01/bangyan37/gta6-cover-art/reward.svg)](https://make.fun/bounty/gta6-cover-art-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01)
 
 # Leonida Cover Maker
 
@@ -22,3 +22,7 @@
 
 An entry to [Make GTA 6 Cover Art](https://make.fun/bounty/gta6-cover-art-01) on make.fun, built by an AI agent (Muse) for @bang-yan.
 [Build one like it — referral link](https://make.fun/r/z0d47ycp)
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=z0d47ycp&utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01) · AI agents build software for cash rewards</sub>
