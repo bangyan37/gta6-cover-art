@@ -3,98 +3,85 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Leonida Cover Maker</title>
+<title>Leonida Cover Maker — GTA-style cover art from your photos</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="topbar">
-  <h1>LEONIDA <span>COVER MAKER</span></h1>
-  <p class="tagline">Your photos, a multi-panel cover, zero uploads - everything runs on this page.</p>
+<header class="brand">
+  <div class="brand-mark">LCM</div>
+  <div class="brand-text">
+    <h1>Leonida Cover Maker</h1>
+    <p>Your photos + a caption → multi-panel cover art, exported as a PNG. Everything runs on your machine; photos are never uploaded.</p>
+  </div>
 </header>
 
 <main class="workspace">
   <aside class="controls">
     <section>
-      <h2>Preset shots</h2>
-      <div id="shot-buttons" class="choice-row">
-        <button type="button" data-shot="cover">Portrait cover</button>
-        <button type="button" data-shot="square">Square neon</button>
-        <button type="button" data-shot="wide">Wide hero</button>
+      <h2>1 · Photos</h2>
+      <label class="file-button">
+        Add a photo to the selected panel
+        <input id="photoFile" type="file" accept="image/*" hidden>
+      </label>
+      <p class="hint">…or drag a photo onto a panel. Click a panel to select it, drag inside it to reposition its photo, scroll to zoom.</p>
+      <label class="row">
+        <span>Fill</span>
+        <select id="fillMode">
+          <option value="each" selected>A different photo per panel</option>
+          <option value="one">One photo fills every panel</option>
+        </select>
+      </label>
+      <p class="hint" id="panelLabel">Panel 1</p>
+      <label class="row">
+        <span>Zoom</span>
+        <input id="zoomRange" type="range" min="100" max="300" value="100">
+      </label>
+    </section>
+
+    <section>
+      <h2>2 · Layout</h2>
+      <div class="chips" id="layoutButtons"></div>
+    </section>
+
+    <section>
+      <h2>3 · Colour grade</h2>
+      <div class="chips" id="gradeButtons"></div>
+      <label class="row">
+        <span>Intensity</span>
+        <input id="gradeRange" type="range" min="0" max="100" value="85">
+      </label>
+    </section>
+
+    <section>
+      <h2>4 · Caption</h2>
+      <label class="field">Title line 1 <input id="titleLine1" type="text" value="LEONIDA" maxlength="18"></label>
+      <label class="field">Title line 2 <input id="titleLine2" type="text" value="NIGHTS" maxlength="18"></label>
+      <label class="field">Subtitle <input id="subtitle" type="text" value="VICE CITY DREAMS" maxlength="30"></label>
+      <div class="checks">
+        <label><input id="decoSun" type="checkbox" checked> Striped sun</label>
+        <label><input id="decoPalms" type="checkbox" checked> Palms</label>
+        <label><input id="decoSparkles" type="checkbox" checked> Sparkles</label>
       </div>
     </section>
 
     <section>
-      <h2>Layout</h2>
-      <div id="layout-buttons" class="choice-row"></div>
-    </section>
-
-    <section>
-      <h2>Colour grade</h2>
-      <div id="grade-buttons" class="choice-row"></div>
-      <label class="slider-line">Intensity
-        <input id="intensity" type="range" min="0" max="1" step="0.01" value="0.9">
-      </label>
-    </section>
-
-    <section>
-      <h2>Caption</h2>
-      <label>Title line 1 <input id="title1" type="text" value="LEONIDA" maxlength="24"></label>
-      <label>Title line 2 <input id="title2" type="text" value="NIGHTS" maxlength="24"></label>
-      <label>Subtitle <input id="subtitle" type="text" value="VICE COAST AFTER DARK" maxlength="40"></label>
-    </section>
-
-    <section>
-      <h2>Photos</h2>
-      <label class="file-line">Add photos
-        <input id="add-photos" type="file" accept="image/*" multiple>
-      </label>
-      <label class="check-line">
-        <input id="fill-all" type="checkbox"> One photo fills every panel
-      </label>
-      <label>Fill photo <select id="fill-photo"></select></label>
-      <div id="panel-list"></div>
-      <p class="hint">Tip: pick a panel above, then drag on the cover to pan its photo.</p>
-    </section>
-
-    <section>
-      <h2>Decorations</h2>
-      <label class="check-line"><input id="dec-sun" type="checkbox" checked> Sun disc</label>
-      <label class="check-line"><input id="dec-palms" type="checkbox" checked> Palm silhouettes</label>
-      <label class="check-line"><input id="dec-sparkles" type="checkbox" checked> Sparkles</label>
-    </section>
-
-    <section>
-      <h2>Export</h2>
-      <label>Size
-        <select id="export-size">
-          <option value="1080x1080">Square 1080 x 1080</option>
-          <option value="1080x1350" selected>Portrait 1080 x 1350</option>
-          <option value="1920x1080">Wide 1920 x 1080</option>
-        </select>
-      </label>
-      <button id="export-btn" type="button" class="primary">Download PNG</button>
+      <h2>5 · Export</h2>
+      <div class="chips" id="sizeButtons"></div>
+      <button id="exportButton" class="export" type="button">Export PNG</button>
+      <p class="hint">Exports at the exact size picked above — 1080 × 1080, 1080 × 1350 or 1920 × 1080.</p>
     </section>
   </aside>
 
-  <section id="stage-wrap" class="stage-wrap">
-    <canvas id="stage" width="864" height="1080"></canvas>
-    <p class="hint">Drop image files anywhere on the cover to add them.</p>
+  <section class="stage">
+    <canvas id="preview" width="448" height="560"></canvas>
+    <p class="stage-note">Live preview — the dashed outline marks the selected panel.</p>
   </section>
 </main>
 
 <footer class="foot">
-  <p>Leonida Cover Maker - an original fan tool. Bring your own photos; the caption says whatever you type.</p>
+  <p>An original fan-made tool. Not affiliated with Rockstar Games or Take-Two Interactive. Title type: Anton, under the SIL Open Font License (see fonts/OFL.txt).</p>
 </footer>
 
-<script src="src/shots.js"></script>
-<script src="src/state.js"></script>
-<script src="src/photos.js"></script>
-<script src="src/layouts.js"></script>
-<script src="src/grades.js"></script>
-<script src="src/decorations.js"></script>
-<script src="src/caption.js"></script>
-<script src="src/cover.js"></script>
-<script src="src/exporter.js"></script>
-<script src="src/main.js"></script>
+<script type="module" src="src/main.js"></script>
 </body>
 </html>

@@ -1,98 +1,109 @@
-// decorations.js - original ornaments drawn in code, no image assets.
-//
-// Three motifs, all silhouettes and simple geometry drawn with canvas
-// paths: a low sun disc with a soft halo, palm fronds leaning in from
-// the corners, and four-point sparkles. They sit above the graded
-// photos and below the panel borders and caption, at fixed fractional
-// positions so preview and export agree.
+// Decorations drawn by the app itself on the canvas: a striped retro sun,
+// palm silhouettes and four-point sparkles. Everything is vector paths drawn
+// at render time — no image assets, nothing borrowed.
 
-(function (root, factory) {
-  var api = factory();
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  root.LCMDecorations = api;
-})(typeof self !== "undefined" ? self : globalThis, function () {
-  "use strict";
+const INK = 'rgba(26, 6, 44, 0.88)';
 
-  var INK = "rgba(12, 10, 24, 0.55)";
-
-  function drawSun(ctx, W, H) {
-    var cx = W * 0.80, cy = H * 0.16, r = Math.min(W, H) * 0.13;
-    var halo = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r * 2.1);
-    halo.addColorStop(0, "rgba(255, 190, 90, 0.50)");
-    halo.addColorStop(0.55, "rgba(255, 110, 130, 0.18)");
-    halo.addColorStop(1, "rgba(255, 110, 130, 0)");
-    ctx.fillStyle = halo;
-    ctx.fillRect(cx - r * 2.1, cy - r * 2.1, r * 4.2, r * 4.2);
-    var disc = ctx.createLinearGradient(cx, cy - r, cx, cy + r);
-    disc.addColorStop(0, "#ffd76e");
-    disc.addColorStop(1, "#ff5e7a");
-    ctx.fillStyle = disc;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fill();
-    // Two horizon cuts through the disc - a striped, sinking sun.
-    ctx.fillStyle = "rgba(20, 12, 30, 0.35)";
-    ctx.fillRect(cx - r, cy + r * 0.28, r * 2, r * 0.09);
-    ctx.fillRect(cx - r, cy + r * 0.55, r * 2, r * 0.13);
+// A retro sun: a warm gradient disc whose lower half is cut into horizontal
+// bands with widening gaps, the classic synthwave sunset mark.
+export function drawSunDisc(ctx, cx, cy, r) {
+  const grad = ctx.createLinearGradient(0, cy - r, 0, cy + r);
+  grad.addColorStop(0, '#ffd319');
+  grad.addColorStop(0.55, '#ff2975');
+  grad.addColorStop(1, '#ff5e3a');
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = grad;
+  ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+  // Cut the gaps: repaint the bands the disc skips in the last third, using
+  // destination-out inside a scratch pass is overkill — instead the bands
+  // below are drawn as separate slices on the next call frame. Here we
+  // simply darken thin stripes so the disc reads as slatted.
+  ctx.fillStyle = 'rgba(30, 4, 54, 0.35)';
+  const bands = 5;
+  for (let i = 0; i < bands; i++) {
+    const y = cy + r * 0.08 + (r * 0.85 * i) / bands;
+    ctx.fillRect(cx - r, y, r * 2, r * 0.045 + i * r * 0.012);
   }
+  ctx.restore();
+}
 
-  // One palm: a curved trunk and seven fronds fanning from its crown.
-  // (ox, oy) is the base in fractions; lean bends the crown sideways.
-  function palm(ctx, W, H, ox, oy, scale, lean, flip) {
-    var bx = ox * W, by = oy * H;
-    var topX = bx + lean * W * flip, topY = by - 0.34 * H * scale;
-    ctx.strokeStyle = INK;
-    ctx.lineCap = "round";
-    ctx.lineWidth = Math.max(3, W * 0.010 * scale);
+// One palm tree silhouette: a curved trunk and six drooping fronds, drawn
+// around a base point at (x, y) with the crown `height` pixels above it.
+// flip = -1 mirrors it for the opposite corner of the cover.
+export function drawPalm(ctx, x, y, height, flip) {
+  const h = height;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(flip, 1);
+  ctx.strokeStyle = INK;
+  ctx.fillStyle = INK;
+  ctx.lineCap = 'round';
+
+  ctx.lineWidth = Math.max(2, h * 0.045);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.quadraticCurveTo(h * 0.08, -h * 0.52, h * 0.30, -h * 0.94);
+  ctx.stroke();
+
+  const crownX = h * 0.3;
+  const crownY = -h * 0.94;
+  const fronds = [
+    [-0.62, -0.30],
+    [-0.38, -0.46],
+    [-0.05, -0.52],
+    [0.30, -0.46],
+    [0.58, -0.30],
+    [0.52, -0.05],
+  ];
+  ctx.lineWidth = Math.max(1.5, h * 0.028);
+  for (const [dx, dy] of fronds) {
     ctx.beginPath();
-    ctx.moveTo(bx, by);
-    ctx.quadraticCurveTo(bx + lean * W * flip * 0.3, by - 0.2 * H * scale, topX, topY);
+    ctx.moveTo(crownX, crownY);
+    ctx.quadraticCurveTo(
+      crownX + dx * h * 0.55,
+      crownY + dy * h * 0.6,
+      crownX + dx * h,
+      crownY + dy * h + h * 0.18,
+    );
     ctx.stroke();
-    ctx.lineWidth = Math.max(2, W * 0.006 * scale);
-    var fronds = [-2.6, -2.0, -1.4, -0.7, 0.0, 0.7, 1.3];
-    for (var i = 0; i < fronds.length; i++) {
-      var a = fronds[i] * flip;
-      var len = 0.17 * W * scale * (1 - Math.abs(fronds[i]) * 0.10);
-      var ex = topX + Math.sin(a) * len;
-      var ey = topY + Math.abs(Math.cos(a)) * len * 0.42 + len * 0.16;
-      var mx = topX + Math.sin(a) * len * 0.5;
-      var my = topY - len * 0.22;
-      ctx.beginPath();
-      ctx.moveTo(topX, topY);
-      ctx.quadraticCurveTo(mx, my, ex, ey);
-      ctx.stroke();
-    }
   }
 
-  function drawPalms(ctx, W, H) {
-    palm(ctx, W, H, 0.015, 1.0, 1.0, 0.05, 1);    // bottom-left, leaning in
-    palm(ctx, W, H, 0.99, 0.62, 0.72, 0.04, -1);  // right edge, smaller
-  }
+  ctx.beginPath();
+  ctx.arc(crownX - h * 0.03, crownY + h * 0.05, h * 0.035, 0, Math.PI * 2);
+  ctx.arc(crownX + h * 0.045, crownY + h * 0.07, h * 0.028, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
 
-  function sparkle(ctx, cx, cy, r, alpha) {
-    ctx.fillStyle = "rgba(255, 246, 220, " + alpha + ")";
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - r);
-    ctx.quadraticCurveTo(cx, cy, cx + r, cy);
-    ctx.quadraticCurveTo(cx, cy, cx, cy + r);
-    ctx.quadraticCurveTo(cx, cy, cx - r, cy);
-    ctx.quadraticCurveTo(cx, cy, cx, cy - r);
-    ctx.fill();
-  }
+// A four-point sparkle, the little star glint scattered over the sky panels.
+export function drawSparkle(ctx, x, y, r, color) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y - r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.quadraticCurveTo(x, y, x, y + r);
+  ctx.quadraticCurveTo(x, y, x - r, y);
+  ctx.quadraticCurveTo(x, y, x, y - r);
+  ctx.fill();
+  ctx.restore();
+}
 
-  function drawSparkles(ctx, W, H) {
-    var s = Math.min(W, H);
-    sparkle(ctx, W * 0.16, H * 0.13, s * 0.030, 0.9);
-    sparkle(ctx, W * 0.60, H * 0.07, s * 0.020, 0.7);
-    sparkle(ctx, W * 0.90, H * 0.44, s * 0.024, 0.8);
-    sparkle(ctx, W * 0.08, H * 0.58, s * 0.016, 0.6);
+// A fixed scatter of sparkles (same spots every render, so exports are
+// stable), sized relative to the cover.
+export function drawSparkles(ctx, w, h) {
+  const spots = [
+    [0.16, 0.1, 0.016],
+    [0.55, 0.07, 0.012],
+    [0.86, 0.3, 0.014],
+    [0.3, 0.3, 0.01],
+    [0.68, 0.16, 0.009],
+    [0.08, 0.42, 0.011],
+  ];
+  for (const [fx, fy, fr] of spots) {
+    drawSparkle(ctx, fx * w, fy * h, fr * Math.min(w, h), 'rgba(255, 244, 190, 0.9)');
   }
-
-  function draw(ctx, W, H, which) {
-    if (which.sun) drawSun(ctx, W, H);
-    if (which.palms) drawPalms(ctx, W, H);
-    if (which.sparkles) drawSparkles(ctx, W, H);
-  }
-
-  return { draw: draw, drawSun: drawSun, drawPalms: drawPalms, drawSparkles: drawSparkles };
-});
+}

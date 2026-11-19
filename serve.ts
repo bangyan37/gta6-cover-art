@@ -1,53 +1,50 @@
-// serve.ts - a tiny static server for trying the app interactively.
-//
-//   node serve.ts [port]
-//
-// Serves the app/ folder on http://localhost:5173 (or the port given).
-// Standard library only, no dependencies, and it refuses to serve
-// anything outside app/ so it can be left running safely.
+// A tiny static server for trying the app locally: `node serve.ts`, then
+// open http://localhost:8080 in a desktop browser. It serves only the app/
+// folder beside this file (never anything above it), with no dependencies,
+// and the app itself needs no network — every file it loads lives in app/.
 
-const http = require("node:http");
-const fs = require("node:fs");
-const path = require("node:path");
+import { createServer } from 'node:http';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { join, normalize, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = path.join(__dirname, "app");
-const PORT = parseInt(process.argv[2] || "5173", 10);
+const root = join(fileURLToPath(new URL('.', import.meta.url)), 'app');
+const port = Number(process.env.PORT || 8080);
 
 const TYPES = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".jpg": "image/jpeg",
-  ".png": "image/png",
-  ".ttf": "font/ttf",
-  ".txt": "text/plain; charset=utf-8",
-  ".md": "text/plain; charset=utf-8"
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.ttf': 'font/ttf',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
-const server = http.createServer((req, res) => {
-  let urlPath = decodeURIComponent((req.url || "/").split("?")[0]);
-  if (urlPath === "/") urlPath = "/index.html";
-  const file = path.normalize(path.join(ROOT, urlPath));
-  if (!file.startsWith(ROOT)) {
-    res.writeHead(403, { "content-type": "text/plain" });
-    res.end("forbidden");
-    return;
-  }
-  fs.readFile(file, (err, data) => {
-    if (err) {
-      res.writeHead(404, { "content-type": "text/plain" });
-      res.end("not found: " + urlPath);
+const server = createServer((req, res) => {
+  try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    let path = decodeURIComponent(url.pathname);
+    if (path === '/') path = '/index.html';
+    const file = normalize(join(root, path));
+    if (!file.startsWith(root) || !existsSync(file) || !statSync(file).isFile()) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('Not found');
       return;
     }
     res.writeHead(200, {
-      "content-type": TYPES[path.extname(file).toLowerCase()] || "application/octet-stream",
-      "cache-control": "no-store"
+      'content-type': TYPES[extname(file).toLowerCase()] || 'application/octet-stream',
+      'cache-control': 'no-store',
     });
-    res.end(data);
-  });
+    res.end(readFileSync(file));
+  } catch (err) {
+    res.writeHead(500, { 'content-type': 'text/plain' });
+    res.end('Server error');
+  }
 });
 
-server.listen(PORT, () => {
-  console.log("Leonida Cover Maker at http://localhost:" + PORT + "/");
+server.listen(port, () => {
+  console.log('Leonida Cover Maker at http://localhost:' + port + ' (serving ' + root + ')');
 });

@@ -1,4 +1,4 @@
-Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/AntonFont)
+Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/Anton)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:
@@ -32,8 +32,8 @@ include source files, build scripts and documentation.
 "Reserved Font Name" refers to any names specified as such after the
 copyright statement(s).
 
-"Original Version" refers to the collection of Font Software components
-as distributed by the Copyright Holder(s).
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
 
 "Modified Version" refers to any derivative made by adding to, deleting,
 or substituting — in part or in whole — any of the components of the
@@ -86,6 +86,7 @@ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
 MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
 OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
 COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-INCLUDING ANY TORT (NEGLIGENCE OR OTHERWISE), WHETHER IN AN ACTION
-OF CONTRACT, ARISING FROM, OR IN ANY WAY CONNECTED WITH THE FONT SOFTWARE
-OR THE USE OR PERFORMANCE OF THE FONT SOFTWARE.
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR OTHERWISE
+DEALING IN THE FONT SOFTWARE.

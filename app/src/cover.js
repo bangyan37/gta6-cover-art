@@ -1,102 +1,129 @@
-// cover.js - the renderer the whole app hangs off.
+// The cover renderer: draws the whole poster onto any 2D context at any
+// size. The editor preview, the PNG exporter and the screenshot modes all
+// call this one function, so what you see is exactly what you export.
 //
-// renderCover paints one cover from state onto any 2d context at any
-// size: photos clipped into the layout's panels (cover-fit, per-panel
-// zoom and pan), the colour grade over the top, the code-drawn
-// decorations, bright strokes along every panel edge, and finally the
-// caption. The preview canvas and the PNG exporter both call this, so
-// what you see is byte-for-byte the composition you download.
+// Order of work: bright seam background, each panel's photo clipped to its
+// polygon and shrunk a touch so the seams show, the colour grade's wash,
+// the app's own decorations, then the caption.
 
-(function (root, factory) {
-  var api = factory();
-  root.LCMCover = api;
-})(typeof self !== "undefined" ? self : globalThis, function () {
-  "use strict";
+import { layoutById } from './layouts.js';
+import { gradeById, applyGradeWash } from './grades.js';
+import { photoById } from './photos.js';
+import { drawSunDisc, drawPalm, drawSparkles } from './decorations.js';
+import { drawCaption } from './caption.js';
 
-  var BORDER = "#fff6e9";
+const SEAM = '#f7f3e8';
 
-  function pathFor(ctx, poly, W, H) {
-    ctx.beginPath();
-    for (var i = 0; i < poly.length; i++) {
-      var x = poly[i][0] * W, y = poly[i][1] * H;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+// Trace a panel polygon, optionally pulled toward its centroid so a seam
+// of the background shows between neighbouring panels.
+function tracePanel(ctx, p, w, h, shrinkPx) {
+  const cx = p.cx * w;
+  const cy = p.cy * h;
+  ctx.beginPath();
+  p.points.forEach(([ux, uy], i) => {
+    let x = ux * w;
+    let y = uy * h;
+    if (shrinkPx > 0) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const d = Math.hypot(dx, dy) || 1;
+      x -= (dx / d) * shrinkPx;
+      y -= (dy / d) * shrinkPx;
     }
-    ctx.closePath();
-  }
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.closePath();
+}
 
-  // Draw one photo into one panel: clip to the polygon, then place the
-  // image so it covers the panel's bounds at the panel's zoom, panned
-  // by the panel's pan fractions of the overflow.
-  function drawPanel(ctx, img, poly, W, H, panel, filter) {
-    var b = LCMLayouts.boundsOf(poly);
-    var bx = b.x * W, by = b.y * H, bw = b.w * W, bh = b.h * H;
+// Draw one photo into a panel with cover-fit: the photo fills the panel's
+// bounding box, the panel's zoom scales it up, and panX/panY (-1..1) slide
+// it within the overflow. The grade's filter is applied to the photo draw.
+function drawPanelPhoto(ctx, img, p, view, w, h, filter) {
+  const bw = (p.maxX - p.minX) * w;
+  const bh = (p.maxY - p.minY) * h;
+  const scale = Math.max(bw / img.naturalWidth, bh / img.naturalHeight) * (view.zoom || 1);
+  const dw = img.naturalWidth * scale;
+  const dh = img.naturalHeight * scale;
+  const midX = ((p.minX + p.maxX) / 2) * w;
+  const midY = ((p.minY + p.maxY) / 2) * h;
+  const roomX = Math.max(0, (dw - bw) / 2);
+  const roomY = Math.max(0, (dh - bh) / 2);
+  const dx = midX - dw / 2 + (view.panX || 0) * roomX;
+  const dy = midY - dh / 2 + (view.panY || 0) * roomY;
+  ctx.save();
+  if (filter) ctx.filter = filter;
+  ctx.drawImage(img, dx, dy, dw, dh);
+  ctx.restore();
+}
+
+// A panel with no photo yet gets a dusk gradient and its number, so the
+// editor never shows a hole and the layout reads at a glance.
+function drawEmptyPanel(ctx, p, index, w, h) {
+  const grad = ctx.createLinearGradient(0, p.minY * h, 0, p.maxY * h);
+  grad.addColorStop(0, '#3b2a63');
+  grad.addColorStop(1, '#191030');
+  ctx.fillStyle = grad;
+  ctx.fillRect(p.minX * w, p.minY * h, (p.maxX - p.minX) * w, (p.maxY - p.minY) * h);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = '600 ' + Math.round(Math.min(w, h) * 0.045) + 'px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('PANEL ' + (index + 1), p.cx * w, p.cy * h);
+  ctx.textAlign = 'left';
+}
+
+export function panelPhotoId(state, index) {
+  if (state.fillMode === 'one') {
+    const first = state.panels[0];
+    return first ? first.photoId : null;
+  }
+  const p = state.panels[index];
+  return p ? p.photoId : null;
+}
+
+export function renderCover(ctx, state, w, h) {
+  const layout = layoutById(state.layoutId);
+  const grade = gradeById(state.gradeId);
+  const seam = Math.max(3, Math.min(w, h) * 0.008);
+
+  ctx.save();
+  ctx.fillStyle = SEAM;
+  ctx.fillRect(0, 0, w, h);
+
+  layout.panels.forEach((p, i) => {
+    const view = state.panels[i] || { zoom: 1, panX: 0, panY: 0 };
     ctx.save();
-    pathFor(ctx, poly, W, H);
+    tracePanel(ctx, p, w, h, seam / 2);
     ctx.clip();
-    if (img) {
-      var scale = Math.max(bw / img.naturalWidth, bh / img.naturalHeight) * (panel.zoom || 1);
-      var dw = img.naturalWidth * scale, dh = img.naturalHeight * scale;
-      var dx = bx + (bw - dw) / 2 + (panel.panX || 0) * Math.max(0, dw - bw);
-      var dy = by + (bh - dh) / 2 + (panel.panY || 0) * Math.max(0, dh - bh);
-      if (filter) ctx.filter = filter;
-      ctx.drawImage(img, dx, dy, dw, dh);
-      ctx.filter = "none";
+    const entry = photoById(panelPhotoId(state, i));
+    if (entry && entry.img.naturalWidth > 0) {
+      drawPanelPhoto(ctx, entry.img, p, view, w, h, grade.filter);
     } else {
-      ctx.fillStyle = "#241f38";
-      ctx.fillRect(bx, by, bw, bh);
+      drawEmptyPanel(ctx, p, i, w, h);
     }
+    applyGradeWash(ctx, grade, p.minX * w, p.minY * h, (p.maxX - p.minX) * w, (p.maxY - p.minY) * h, state.gradeIntensity);
     ctx.restore();
-  }
 
-  function renderCover(ctx, W, H, state) {
-    var layout = LCMLayouts.byId(state.layout);
-    var grade = LCMGrades.byId(state.grade);
-    var g = LCMGrades.resolve(grade, state.intensity);
-    var filter = LCMGrades.filterString(grade, state.intensity);
-    var polys = layout.panels();
-
+    // A faint inner keyline gives each panel a printed-poster edge.
     ctx.save();
-    ctx.fillStyle = "#14101f";
-    ctx.fillRect(0, 0, W, H);
-
-    for (var i = 0; i < polys.length; i++) {
-      var panel = state.panels[i] || { photo: -1, zoom: 1.15, panX: 0, panY: 0 };
-      var idx = LCMState.photoIndexFor(state, i);
-      var img = idx >= 0 && state.photos[idx] ? state.photos[idx].img : null;
-      drawPanel(ctx, img, polys[i], W, H, panel, filter);
-    }
-
-    // Tint wash and vignette: the parts of a grade a CSS filter
-    // cannot express.
-    if (g.tintAlpha > 0) {
-      ctx.fillStyle = "rgba(" + g.tint[0] + "," + g.tint[1] + "," + g.tint[2] + "," + g.tintAlpha.toFixed(3) + ")";
-      ctx.fillRect(0, 0, W, H);
-    }
-    if (g.vignette > 0) {
-      var vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.42, W / 2, H / 2, Math.max(W, H) * 0.78);
-      vg.addColorStop(0, "rgba(8, 6, 16, 0)");
-      vg.addColorStop(1, "rgba(8, 6, 16, " + g.vignette.toFixed(3) + ")");
-      ctx.fillStyle = vg;
-      ctx.fillRect(0, 0, W, H);
-    }
-
-    LCMDecorations.draw(ctx, W, H, state.decorations);
-
-    // Bright dividers: stroke every panel, then the outer frame a
-    // touch heavier.
-    ctx.strokeStyle = BORDER;
-    ctx.lineJoin = "round";
-    ctx.lineWidth = Math.max(3, W * 0.007);
-    for (var j = 0; j < polys.length; j++) {
-      pathFor(ctx, polys[j], W, H);
-      ctx.stroke();
-    }
-    ctx.lineWidth = Math.max(5, W * 0.011);
-    ctx.strokeRect(0, 0, W, H);
-
-    LCMCaption.draw(ctx, W, H, state.titleLines, state.subtitle);
+    tracePanel(ctx, p, w, h, seam / 2);
+    ctx.strokeStyle = 'rgba(10, 4, 24, 0.25)';
+    ctx.lineWidth = Math.max(1, seam * 0.22);
+    ctx.stroke();
     ctx.restore();
+  });
+
+  if (state.decorations.sun) {
+    drawSunDisc(ctx, w * 0.815, h * 0.155, Math.min(w, h) * 0.115);
+  }
+  if (state.decorations.sparkles) {
+    drawSparkles(ctx, w, h);
+  }
+  if (state.decorations.palms) {
+    drawPalm(ctx, w * 0.015, h * 1.005, h * 0.30, 1);
+    drawPalm(ctx, w * 0.985, h * 1.005, h * 0.24, -1);
   }
 
-  return { renderCover: renderCover, pathFor: pathFor };
-});
+  drawCaption(ctx, state, w, h);
+  ctx.restore();
+}

@@ -4,22 +4,25 @@
 [![rank](https://make.fun/badge/gta6-cover-art-01/bangyan37/gta6-cover-art/rank.svg)](https://make.fun/bounty/gta6-cover-art-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01)
 [![reward](https://make.fun/badge/gta6-cover-art-01/bangyan37/gta6-cover-art/reward.svg)](https://make.fun/bounty/gta6-cover-art-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-cover-art-01)
 
-**Leonida Cover Maker** is an offline web app that turns your own photos and captions into multi-panel, cover-style posters for the fictional coast of Leonida. It runs entirely in the browser - no uploads, no accounts, no network calls.
+**Leonida Cover Maker** — an offline web app that turns your own photos and a caption into multi-panel, GTA-style cover art you can post. Drop in a photo, pick a panel layout, drench it in a Vice City colour grade, set the big Anton title, and export a PNG at 1080 × 1080, 1080 × 1350 or 1920 × 1080. Your photos never leave your machine: the app is plain static files under `app/` and makes no network requests.
 
-- **Four panel layouts** with bright dividers: Slash Six (a slanted 3x2 grid), Hero + Trio, Quad Cross, and Speed Strips.
-- **Your photos, your framing:** load pictures per panel, pick one photo to fill every panel, zoom each panel with a slider and drag on the cover to pan. Two bundled sample photos (a boulevard and a pier) are loaded by default.
-- **Four colour grades** - Vice Sunset, Neon Nights, Golden Hour, Mono Noir - with an intensity slider.
-- **Editable caption:** a two-line title and a subtitle set in the bundled Anton typeface (SIL Open Font License 1.1, see `app/fonts/OFL.txt`), over a legibility gradient. The app never stamps a real game's name on a cover; the words are yours.
-- **Original decorations** drawn in code: a striped sun disc, palm silhouettes and sparkles.
-- **Exact-size PNG export:** 1080x1080, 1080x1350 or 1920x1080, rendered offscreen at full resolution.
+What it does:
 
-Running `node main.ts` regenerates the four screenshots in `screenshots/` headlessly - a portrait export, the editor at 1280x800, a square Neon export and a wide hero export - using a pure-Node pipeline (its own progressive-JPEG codec and TrueType rasteriser for the bundled Anton) over the same shot definitions the app uses (`app/src/shots.js`).
+- **Four panel layouts** with bright seams — Diagonal Six, Hero + Three, Grid Four and Diagonal Strips.
+- **Any photo, any panel** — load photos from your files or drag-and-drop them onto a panel, fill every panel with one photo or give each its own, then drag to reposition and scroll to zoom each panel's crop.
+- **Four colour grades** — Vice Sunset, Neon Nights, Golden Hour and Mono Noir — each with an intensity slider.
+- **Your caption** — a two-line title and subtitle in the bundled Anton typeface (SIL Open Font License, `app/fonts/OFL.txt`), with the app's own canvas-drawn decorations: a striped retro sun, palm silhouettes and sparkles.
+- **Original by design** — no Rockstar logos, artwork or fonts; the two bundled sample photos were made with an image model and are free to use.
+
+The screenshots in `screenshots/` are the app's own output: the portrait cover it exports, the editor with a photo loaded, and the square and wide exports in other layouts and grades.
+
+`main.ts` is the hand-in program: it copies `app/` and `screenshots/` into the output directory (`MAKEFUN_OUTPUT_DIR`, or `/output` in the grader) and writes `dossier.json` with `buildDossier` from `vendor/makefun-app.ts`. It writes nothing into the repository, reads its location from `MAKEFUN_BOT_DIR` or its own path rather than the working directory, and needs no network.
 
 ## Run it
 
 ```sh
-node serve.ts        # then open http://localhost:5173
-node main.ts         # regenerate screenshots/ without a browser
+node serve.ts   # serves the app locally — open http://localhost:8080
+MAKEFUN_OUTPUT_DIR=out node main.ts   # hand the entry in: copies app/ + screenshots/ to out/ and writes out/dossier.json
 ```
 
 ---

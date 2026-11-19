@@ -1,84 +1,51 @@
-// state.js - one mutable state object for the editor, with listeners.
+// Shared state for Leonida Cover Maker.
 //
-// Everything the user can change lives here: the layout and grade, the
-// caption, which photo sits in which panel, per-panel zoom and pan,
-// the decoration toggles and the export size. cover.js renders purely
-// from this object, so the preview, the PNG export and the preset
-// shots can never disagree about what a cover is.
+// One plain object holds everything the editor shows: the chosen layout and
+// colour grade, the caption text, which photo sits in which panel and how
+// each photo is zoomed and panned. Modules read it directly; the editor
+// calls emitStateChange() after a change and the preview re-renders.
 
-(function (root, factory) {
-  var api = factory();
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  root.LCMState = api;
-})(typeof self !== "undefined" ? self : globalThis, function () {
-  "use strict";
+export const EXPORT_SIZES = {
+  square: { id: 'square', label: 'Square · 1080 × 1080', width: 1080, height: 1080 },
+  portrait: { id: 'portrait', label: 'Portrait · 1080 × 1350', width: 1080, height: 1350 },
+  wide: { id: 'wide', label: 'Wide · 1920 × 1080', width: 1920, height: 1080 },
+};
 
-  function blankPanel() {
-    // photo: index into state.photos, or -1 to leave the panel to the
-    // round-robin default. zoom multiplies the cover-fit scale; pan is
-    // in fractions of the panel's overflow.
-    return { photo: -1, zoom: 1.15, panX: 0, panY: 0 };
-  }
+export function blankPanel(photoId) {
+  return { photoId: photoId || null, zoom: 1, panX: 0, panY: 0 };
+}
 
-  function createState() {
-    return {
-      layout: "slash-six",
-      grade: "vice",
-      intensity: 0.9,
-      titleLines: ["LEONIDA", "NIGHTS"],
-      subtitle: "VICE COAST AFTER DARK",
-      fillAll: false,
-      fillPhoto: 0,
-      exportSize: "1080x1350",
-      decorations: { sun: true, palms: true, sparkles: true },
-      photos: [],        // {name, img} - img is an Image or canvas source
-      panels: [blankPanel(), blankPanel(), blankPanel(), blankPanel(), blankPanel(), blankPanel()],
-      selectedPanel: 0
-    };
-  }
+export function createState() {
+  return {
+    layoutId: 'diagonal-six',
+    gradeId: 'vice-sunset',
+    gradeIntensity: 0.85,
+    sizeId: 'portrait',
+    titleLine1: 'LEONIDA',
+    titleLine2: 'NIGHTS',
+    subtitle: 'VICE CITY DREAMS',
+    fillMode: 'each',
+    selectedPanel: 0,
+    panels: [],
+    decorations: { sun: true, palms: true, sparkles: true },
+  };
+}
 
-  // Which photo index a panel shows: its own pick, the fill-all pick,
-  // or the panel number modulo the photo count.
-  function photoIndexFor(state, panelIdx) {
-    if (!state.photos.length) return -1;
-    if (state.fillAll) return Math.min(state.fillPhoto, state.photos.length - 1);
-    var own = state.panels[panelIdx] ? state.panels[panelIdx].photo : -1;
-    if (own >= 0 && own < state.photos.length) return own;
-    return panelIdx % state.photos.length;
-  }
+// Keep state.panels the right length for a layout, preserving the panels
+// that already exist so switching layouts never loses a placed photo.
+export function fitPanels(state, count) {
+  while (state.panels.length < count) state.panels.push(blankPanel(null));
+  state.panels.length = count;
+  if (state.selectedPanel >= count) state.selectedPanel = 0;
+}
 
-  function makeStore(initial) {
-    var state = initial || createState();
-    var listeners = [];
-    return {
-      state: state,
-      on: function (fn) { listeners.push(fn); },
-      emit: function () {
-        for (var i = 0; i < listeners.length; i++) listeners[i](state);
-      },
-      // Load a shot definition (app/src/shots.js) into the editor.
-      applyShot: function (shot, photoByName) {
-        state.layout = shot.layout;
-        state.grade = shot.grade;
-        state.intensity = shot.intensity;
-        state.titleLines = shot.title.slice();
-        state.subtitle = shot.subtitle;
-        state.decorations = {
-          sun: !!shot.decorations.sun,
-          palms: !!shot.decorations.palms,
-          sparkles: !!shot.decorations.sparkles
-        };
-        state.exportSize = shot.width + "x" + shot.height;
-        for (var i = 0; i < state.panels.length; i++) {
-          state.panels[i].photo = photoByName(shot.photos[i % shot.photos.length]);
-          state.panels[i].zoom = shot.zooms[i % shot.zooms.length];
-          state.panels[i].panX = 0;
-          state.panels[i].panY = 0;
-        }
-        this.emit();
-      }
-    };
-  }
+const listeners = new Set();
 
-  return { createState: createState, photoIndexFor: photoIndexFor, makeStore: makeStore, blankPanel: blankPanel };
-});
+export function onStateChange(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+export function emitStateChange() {
+  for (const fn of listeners) fn();
+}
