@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -7,88 +7,94 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="masthead">
-  <div>
-    <h1>Leonida Cover Maker</h1>
-    <p class="tagline">Turn your own photos into a multi-panel neon poster cover. Everything runs on this machine: no uploads, no accounts.</p>
-  </div>
-  <p class="hint">Drop photos onto the cover, drag a panel to reframe it, pick a layout and a grade, then export a PNG.</p>
+<header class="topbar">
+  <h1>LEONIDA <span>COVER MAKER</span></h1>
+  <p class="tagline">Your photos, a multi-panel cover, zero uploads - everything runs on this page.</p>
 </header>
 
 <main class="workspace">
-  <section class="stage" aria-label="Cover preview">
-    <canvas id="coverCanvas" width="864" height="1080"></canvas>
-    <p id="statusLine" class="status" role="status">Loading the sample photos…</p>
-  </section>
+  <aside class="controls">
+    <section>
+      <h2>Preset shots</h2>
+      <div id="shot-buttons" class="choice-row">
+        <button type="button" data-shot="cover">Portrait cover</button>
+        <button type="button" data-shot="square">Square neon</button>
+        <button type="button" data-shot="wide">Wide hero</button>
+      </div>
+    </section>
 
-  <aside class="controls" aria-label="Cover controls">
-    <fieldset>
-      <legend>1 · Photos</legend>
-      <label class="file-pick">
-        <span>Add photos from this machine</span>
-        <input id="photoInput" type="file" accept="image/*" multiple>
-      </label>
-      <div id="sampleRow" class="row"></div>
-      <label class="check">
-        <input id="singlePhoto" type="checkbox">
-        <span>One photo fills every panel</span>
-      </label>
-      <div id="panelChips" class="chips" aria-label="Panels"></div>
-      <label class="slider">
-        <span>Panel zoom</span>
-        <input id="zoomRange" type="range" min="1" max="3" step="0.01" value="1">
-      </label>
-    </fieldset>
+    <section>
+      <h2>Layout</h2>
+      <div id="layout-buttons" class="choice-row"></div>
+    </section>
 
-    <fieldset>
-      <legend>2 · Layout</legend>
-      <div id="layoutList" class="choices"></div>
-    </fieldset>
+    <section>
+      <h2>Colour grade</h2>
+      <div id="grade-buttons" class="choice-row"></div>
+      <label class="slider-line">Intensity
+        <input id="intensity" type="range" min="0" max="1" step="0.01" value="0.9">
+      </label>
+    </section>
 
-    <fieldset>
-      <legend>3 · Colour grade</legend>
-      <div id="gradeList" class="choices compact"></div>
-      <label class="slider">
-        <span>Grade strength</span>
-        <input id="gradeStrength" type="range" min="0" max="1" step="0.01" value="0.85">
-      </label>
-    </fieldset>
+    <section>
+      <h2>Caption</h2>
+      <label>Title line 1 <input id="title1" type="text" value="LEONIDA" maxlength="24"></label>
+      <label>Title line 2 <input id="title2" type="text" value="NIGHTS" maxlength="24"></label>
+      <label>Subtitle <input id="subtitle" type="text" value="VICE COAST AFTER DARK" maxlength="40"></label>
+    </section>
 
-    <fieldset>
-      <legend>4 · Caption</legend>
-      <label class="text-field">
-        <span>Title</span>
-        <input id="titleInput" type="text" maxlength="26" value="LEONIDA NIGHTS">
+    <section>
+      <h2>Photos</h2>
+      <label class="file-line">Add photos
+        <input id="add-photos" type="file" accept="image/*" multiple>
       </label>
-      <label class="text-field">
-        <span>Subtitle</span>
-        <input id="subtitleInput" type="text" maxlength="34" value="VICE DISTRICT DIARIES">
+      <label class="check-line">
+        <input id="fill-all" type="checkbox"> One photo fills every panel
       </label>
-      <label class="check">
-        <input id="decoSun" type="checkbox" checked>
-        <span>Sun disc</span>
-      </label>
-      <label class="check">
-        <input id="decoPalms" type="checkbox" checked>
-        <span>Palm silhouettes</span>
-      </label>
-      <label class="check">
-        <input id="decoSparkles" type="checkbox" checked>
-        <span>Sparkles</span>
-      </label>
-    </fieldset>
+      <label>Fill photo <select id="fill-photo"></select></label>
+      <div id="panel-list"></div>
+      <p class="hint">Tip: pick a panel above, then drag on the cover to pan its photo.</p>
+    </section>
 
-    <fieldset>
-      <legend>5 · Export PNG</legend>
-      <div id="exportRow" class="exports"></div>
-    </fieldset>
+    <section>
+      <h2>Decorations</h2>
+      <label class="check-line"><input id="dec-sun" type="checkbox" checked> Sun disc</label>
+      <label class="check-line"><input id="dec-palms" type="checkbox" checked> Palm silhouettes</label>
+      <label class="check-line"><input id="dec-sparkles" type="checkbox" checked> Sparkles</label>
+    </section>
+
+    <section>
+      <h2>Export</h2>
+      <label>Size
+        <select id="export-size">
+          <option value="1080x1080">Square 1080 x 1080</option>
+          <option value="1080x1350" selected>Portrait 1080 x 1350</option>
+          <option value="1920x1080">Wide 1920 x 1080</option>
+        </select>
+      </label>
+      <button id="export-btn" type="button" class="primary">Download PNG</button>
+    </section>
   </aside>
+
+  <section id="stage-wrap" class="stage-wrap">
+    <canvas id="stage" width="864" height="1080"></canvas>
+    <p class="hint">Drop image files anywhere on the cover to add them.</p>
+  </section>
 </main>
 
-<footer class="colophon">
-  <p>An original fan-made poster tool. Lettering is set in Anton (SIL Open Font License 1.1, bundled under <em>fonts/</em>). The sample photos were made with an image model and are free to use. Not affiliated with any game publisher.</p>
+<footer class="foot">
+  <p>Leonida Cover Maker - an original fan tool. Bring your own photos; the caption says whatever you type.</p>
 </footer>
 
-<script type="module" src="src/main.js"></script>
+<script src="src/shots.js"></script>
+<script src="src/state.js"></script>
+<script src="src/photos.js"></script>
+<script src="src/layouts.js"></script>
+<script src="src/grades.js"></script>
+<script src="src/decorations.js"></script>
+<script src="src/caption.js"></script>
+<script src="src/cover.js"></script>
+<script src="src/exporter.js"></script>
+<script src="src/main.js"></script>
 </body>
 </html>

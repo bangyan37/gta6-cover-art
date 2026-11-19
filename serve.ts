@@ -1,87 +1,53 @@
-// serve.ts — a small static file server for trying the app locally.
+// serve.ts - a tiny static server for trying the app interactively.
 //
-//   node serve.ts [--port 8080]
+//   node serve.ts [port]
 //
-// It serves only the app/ folder next to this file, on this machine, with
-// no build step and no dependencies beyond Node's standard library. Any
-// request that tries to climb out of app/ is refused. This is a
-// development convenience for previewing the cover maker in a browser;
-// it is not part of the handed-in program and is never run by the
-// grader.
+// Serves the app/ folder on http://localhost:5173 (or the port given).
+// Standard library only, no dependencies, and it refuses to serve
+// anything outside app/ so it can be left running safely.
 
-import { readFile, stat } from 'node:fs/promises';
-import { createServer } from 'node:http';
-import { extname, join, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
 
-const appRoot = resolve(fileURLToPath(new URL('./app', import.meta.url)));
+const ROOT = path.join(__dirname, "app");
+const PORT = parseInt(process.argv[2] || "5173", 10);
 
-function chosenPort(argv) {
-  const flagAt = argv.indexOf('--port');
-  const raw = flagAt === -1 ? 8080 : Number(argv[flagAt + 1]);
-  return Number.isInteger(raw) && raw > 0 && raw < 65536 ? raw : 8080;
-}
+const TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".ttf": "font/ttf",
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/plain; charset=utf-8"
+};
 
-const CONTENT_TYPES = new Map([
-  ['.html', 'text/html; charset=utf-8'],
-  ['.css', 'text/css; charset=utf-8'],
-  ['.js', 'text/javascript; charset=utf-8'],
-  ['.mjs', 'text/javascript; charset=utf-8'],
-  ['.json', 'application/json; charset=utf-8'],
-  ['.txt', 'text/plain; charset=utf-8'],
-  ['.png', 'image/png'],
-  ['.jpg', 'image/jpeg'],
-  ['.jpeg', 'image/jpeg'],
-  ['.webp', 'image/webp'],
-  ['.gif', 'image/gif'],
-  ['.svg', 'image/svg+xml'],
-  ['.ttf', 'font/ttf'],
-  ['.otf', 'font/otf'],
-  ['.woff', 'font/woff'],
-  ['.woff2', 'font/woff2'],
-  ['.ico', 'image/x-icon'],
-  ['.wasm', 'application/wasm'],
-]);
-
-// Turn a request path into a file inside app/, or null when it escapes.
-function fileInsideApp(requestPath) {
-  let decoded;
-  try {
-    decoded = decodeURIComponent(requestPath);
-  } catch {
-    return null;
-  }
-  if (decoded.endsWith('/')) decoded += 'index.html';
-  const candidate = resolve(join(appRoot, `.${decoded}`));
-  if (candidate !== appRoot && !candidate.startsWith(appRoot + sep)) return null;
-  return candidate;
-}
-
-const server = createServer(async (request, response) => {
-  const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-  const file = fileInsideApp(url.pathname);
-  if (file === null) {
-    response.writeHead(403, { 'content-type': 'text/plain' });
-    response.end('outside the app folder');
+const server = http.createServer((req, res) => {
+  let urlPath = decodeURIComponent((req.url || "/").split("?")[0]);
+  if (urlPath === "/") urlPath = "/index.html";
+  const file = path.normalize(path.join(ROOT, urlPath));
+  if (!file.startsWith(ROOT)) {
+    res.writeHead(403, { "content-type": "text/plain" });
+    res.end("forbidden");
     return;
   }
-  try {
-    const info = await stat(file);
-    if (!info.isFile()) throw new Error('directory');
-    const body = await readFile(file);
-    response.writeHead(200, {
-      'content-type': CONTENT_TYPES.get(extname(file).toLowerCase()) ?? 'application/octet-stream',
-      'content-length': body.length,
-      'cache-control': 'no-store',
+  fs.readFile(file, (err, data) => {
+    if (err) {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("not found: " + urlPath);
+      return;
+    }
+    res.writeHead(200, {
+      "content-type": TYPES[path.extname(file).toLowerCase()] || "application/octet-stream",
+      "cache-control": "no-store"
     });
-    response.end(body);
-  } catch {
-    response.writeHead(404, { 'content-type': 'text/plain' });
-    response.end('not found');
-  }
+    res.end(data);
+  });
 });
 
-const port = chosenPort(process.argv.slice(2));
-server.listen(port, '127.0.0.1', () => {
-  console.log(`Leonida Cover Maker is being served at http://localhost:${port}`);
+server.listen(PORT, () => {
+  console.log("Leonida Cover Maker at http://localhost:" + PORT + "/");
 });

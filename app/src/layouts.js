@@ -1,126 +1,86 @@
-// Panel layouts for Leonida Cover Maker.
+// layouts.js - panel geometry for Leonida Cover Maker.
 //
-// Every layout is a list of panels, and every panel is a polygon written in
-// normalised cover coordinates (x and y both run 0..1, y pointing down).
-// The renderer scales the polygons to whatever pixel size a cover is drawn
-// at, clips each panel's photo to its polygon, and strokes the polygon
-// edges with the bright border colour, which is what gives the covers
-// their poster look. Keeping the geometry in this one pure module means
-// the browser editor and the headless program in main.ts cut exactly the
-// same panels.
-//
-// A "slant" is how far a divider leans: a divider that would be a straight
-// horizontal line instead drops by `slant` of the cover height from its
-// left end to its right end (negative slants rise instead).
+// A layout is a list of polygons. Every vertex is a fraction of the
+// canvas (x of width, y of height), so the same layout renders at the
+// 540px preview size and at a 1920px export without rescaling logic.
+// Panels always tile the whole canvas; cover.js strokes the shared
+// edges afterwards, which is what gives the bright dividers.
 
-function quad(x0, y0, x1, y1, slant) {
-  // A rectangle whose top and bottom edges lean by `slant`.
-  return [
-    [x0, y0],
-    [x1, y0 + slant],
-    [x1, y1 + slant],
-    [x0, y1],
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  root.LCMLayouts = api;
+})(typeof self !== "undefined" ? self : globalThis, function () {
+  "use strict";
+
+  // Six panels: two rows of three, every divider leaning a few degrees
+  // off vertical/horizontal so the grid feels like it is moving.
+  function slashSix() {
+    return [
+      [[0, 0], [0.35, 0], [0.33, 0.51], [0, 0.54]],
+      [[0.35, 0], [0.68, 0], [0.66, 0.51], [0.33, 0.51]],
+      [[0.68, 0], [1, 0], [1, 0.48], [0.66, 0.51]],
+      [[0, 0.54], [0.33, 0.51], [0.31, 1], [0, 1]],
+      [[0.33, 0.51], [0.66, 0.51], [0.64, 1], [0.31, 1]],
+      [[0.66, 0.51], [1, 0.48], [1, 1], [0.64, 1]]
+    ];
+  }
+
+  // One wide hero panel on top, a trio of uprights underneath it.
+  function heroTrio() {
+    return [
+      [[0, 0], [1, 0], [1, 0.58], [0, 0.64]],
+      [[0, 0.64], [0.36, 0.615], [0.34, 1], [0, 1]],
+      [[0.36, 0.615], [0.68, 0.60], [0.67, 1], [0.34, 1]],
+      [[0.68, 0.60], [1, 0.58], [1, 1], [0.67, 1]]
+    ];
+  }
+
+  // A 2x2 grid whose centre cross is pushed off-middle, so no two
+  // panels share the same shape.
+  function quadCross() {
+    return [
+      [[0, 0], [0.52, 0], [0.50, 0.48], [0, 0.50]],
+      [[0.52, 0], [1, 0], [1, 0.46], [0.50, 0.48]],
+      [[0, 0.50], [0.50, 0.48], [0.49, 1], [0, 1]],
+      [[0.50, 0.48], [1, 0.46], [1, 1], [0.49, 1]]
+    ];
+  }
+
+  // Four tall strips, each sheared so the top edge sits to the right
+  // of the bottom edge - a barcode of photographs.
+  function strips() {
+    return [
+      [[0, 0], [0.28, 0], [0.16, 1], [0, 1]],
+      [[0.28, 0], [0.53, 0], [0.41, 1], [0.16, 1]],
+      [[0.53, 0], [0.78, 0], [0.66, 1], [0.41, 1]],
+      [[0.78, 0], [1, 0], [1, 1], [0.66, 1]]
+    ];
+  }
+
+  var LAYOUTS = [
+    { id: "slash-six", name: "Slash Six", panels: slashSix },
+    { id: "hero-trio", name: "Hero + Trio", panels: heroTrio },
+    { id: "quad-cross", name: "Quad Cross", panels: quadCross },
+    { id: "strips", name: "Speed Strips", panels: strips }
   ];
-}
 
-function panelRow(y0, y1, slant, cuts) {
-  // One horizontal band split at the given x positions.
-  const edges = [0, ...cuts, 1];
-  const panels = [];
-  for (let i = 0; i + 1 < edges.length; i += 1) {
-    panels.push(quad(edges[i], y0, edges[i + 1], y1, slant));
+  function byId(id) {
+    for (var i = 0; i < LAYOUTS.length; i++) if (LAYOUTS[i].id === id) return LAYOUTS[i];
+    return LAYOUTS[0];
   }
-  return panels;
-}
 
-export const LAYOUTS = [
-  {
-    id: 'diagonal-six',
-    name: 'Diagonal Six',
-    blurb: 'Six panels in three leaning rows, the classic cover grid.',
-    panels: [
-      ...panelRow(0, 0.36, 0.05, [0.52]),
-      ...panelRow(0.36, 0.68, -0.04, [0.46]),
-      ...panelRow(0.68, 1, 0.03, [0.55]),
-    ],
-  },
-  {
-    id: 'hero-top',
-    name: 'Hero and Three',
-    blurb: 'One wide hero panel over a row of three.',
-    panels: [
-      quad(0, 0, 1, 0.56, 0.04),
-      ...panelRow(0.56, 1, -0.03, [0.34, 0.67]),
-    ],
-  },
-  {
-    id: 'quad-four',
-    name: 'Quad Four',
-    blurb: 'A two-by-two grid with a crossed diagonal lean.',
-    panels: [
-      quad(0, 0, 0.52, 0.5, 0.06),
-      quad(0.52, 0, 1, 0.5, -0.02),
-      quad(0, 0.5, 0.48, 1, -0.05),
-      quad(0.48, 0.5, 1, 1, 0.04),
-    ],
-  },
-  {
-    id: 'strips',
-    name: 'Neon Strips',
-    blurb: 'Four tall diagonal strips leaning into the light.',
-    panels: [0, 1, 2, 3].map((i) => {
-      const x0 = i * 0.25;
-      const x1 = x0 + 0.25;
-      const lean = 0.09;
-      return [
-        [x0 + lean, 0],
-        [x1 + lean, 0],
-        [x1 - lean, 1],
-        [x0 - lean, 1],
-      ];
-    }),
-  },
-];
-
-// Look a layout up by id, falling back to the first one.
-export function getLayout(layoutId) {
-  return LAYOUTS.find((layout) => layout.id === layoutId) ?? LAYOUTS[0];
-}
-
-// Axis-aligned bounds of one panel, in normalised coordinates.
-export function panelBounds(panel) {
-  let minX = 1;
-  let minY = 1;
-  let maxX = 0;
-  let maxY = 0;
-  for (const [x, y] of panel) {
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-  }
-  return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY };
-}
-
-// Even-odd point-in-polygon test in normalised coordinates; used by the
-// editor to pick the panel under the pointer.
-export function pointInPanel(panel, px, py) {
-  let inside = false;
-  for (let i = 0, j = panel.length - 1; i < panel.length; j = i, i += 1) {
-    const [xi, yi] = panel[i];
-    const [xj, yj] = panel[j];
-    const crosses = yi > py !== yj > py;
-    if (crosses && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
-      inside = !inside;
+  // Axis-aligned bounds of one panel, in fractions.
+  function boundsOf(poly) {
+    var minX = 1, minY = 1, maxX = 0, maxY = 0;
+    for (var i = 0; i < poly.length; i++) {
+      if (poly[i][0] < minX) minX = poly[i][0];
+      if (poly[i][0] > maxX) maxX = poly[i][0];
+      if (poly[i][1] < minY) minY = poly[i][1];
+      if (poly[i][1] > maxY) maxY = poly[i][1];
     }
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
-  return inside;
-}
 
-// Index of the panel containing a normalised point, or -1.
-export function panelIndexAt(layout, px, py) {
-  for (let i = 0; i < layout.panels.length; i += 1) {
-    if (pointInPanel(layout.panels[i], px, py)) return i;
-  }
-  return -1;
-}
+  return { LAYOUTS: LAYOUTS, byId: byId, boundsOf: boundsOf };
+});

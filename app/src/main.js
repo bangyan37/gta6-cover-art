@@ -1,323 +1,245 @@
-// Leonida Cover Maker: the editor's wiring.
+// main.js - wires the editor page to the store and the renderer.
 //
-// This module owns the page: it builds the control lists from the shared
-// layout and grade data, keeps the preview canvas rendering the current
-// state, and connects every gesture (picking files, dropping photos onto
-// panels, dragging a panel to reframe it, sliding zoom and grade
-// strength, typing the caption, pressing an export button).
-//
-// It also stages screenshot scenes: an address like
-//   ?shot=3-square.jpg
-// loads the matching shared shot definition (src/shots.js), applies it,
-// and renders the cover (or, for the editor shot, just leaves the staged
-// editor on screen) so the app's own screenshots always show the app
-// itself.
+// Every control writes into the one state object (state.js); every
+// state change repaints the preview through cover.js. This file owns
+// no drawing of its own - it is forms, buttons and pointer handling.
 
-import { LAYOUTS, getLayout, panelIndexAt } from './layouts.js';
-import { GRADES } from './grades.js';
-import { PhotoLibrary, SAMPLE_PHOTOS } from './photos.js';
-import {
-  createCoverState,
-  stateFromShot,
-  visiblePanelCount,
-  assignPhoto,
-  clampPanel,
-} from './state.js';
-import { renderCover } from './cover.js';
-import { EXPORT_SIZES, exportCoverPNG } from './exporter.js';
-import { SHOT_LIST } from './shots.js';
+(function () {
+  "use strict";
 
-const PREVIEW_LONG_SIDE = 900;
+  var store = LCMState.makeStore();
+  var state = store.state;
 
-const library = new PhotoLibrary();
-let state = createCoverState();
-let renderQueued = false;
+  var stage = document.getElementById("stage");
+  var stageCtx = stage.getContext("2d");
 
-const els = {};
+  function $(id) { return document.getElementById(id); }
 
-function grabElements() {
-  const ids = [
-    'coverCanvas', 'photoInput', 'sampleRow', 'singlePhoto', 'panelChips',
-    'layoutList', 'gradeList', 'gradeStrength', 'titleInput', 'subtitleInput',
-    'decoSun', 'decoPalms', 'decoSparkles', 'zoomRange', 'exportRow', 'statusLine',
-  ];
-  for (const id of ids) els[id] = document.getElementById(id);
-}
-
-function setStatus(message) {
-  if (els.statusLine) els.statusLine.textContent = message;
-}
-
-// Size the preview canvas to the staged export shape (portrait by
-// default) and render.
-function fitPreviewToShape(width, height) {
-  const scale = PREVIEW_LONG_SIDE / Math.max(width, height);
-  els.coverCanvas.width = Math.round(width * scale);
-  els.coverCanvas.height = Math.round(height * scale);
-}
-
-function render() {
-  renderCover(els.coverCanvas, state, library);
-  refreshPanelChips();
-}
-
-function requestRender() {
-  if (renderQueued) return;
-  renderQueued = true;
-  requestAnimationFrame(() => {
-    renderQueued = false;
-    render();
-  });
-}
-
-// --- control builders -------------------------------------------------
-
-function buildLayoutList() {
-  els.layoutList.innerHTML = '';
-  for (const layout of LAYOUTS) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'choice' + (layout.id === state.layoutId ? ' picked' : '');
-    button.innerHTML = `<strong>${layout.name}</strong><span>${layout.blurb}</span>`;
-    button.addEventListener('click', () => {
-      state.layoutId = layout.id;
-      state.selectedPanel = 0;
-      buildLayoutList();
-      requestRender();
-    });
-    els.layoutList.appendChild(button);
+  function repaint() {
+    var w = stage.width, h = stage.height;
+    LCMCover.renderCover(stageCtx, w, h, state);
   }
-}
+  store.on(repaint);
 
-function buildGradeList() {
-  els.gradeList.innerHTML = '';
-  for (const grade of GRADES) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'choice' + (grade.id === state.gradeId ? ' picked' : '');
-    button.innerHTML = `<strong>${grade.name}</strong>`;
-    button.addEventListener('click', () => {
-      state.gradeId = grade.id;
-      buildGradeList();
-      requestRender();
+  // --- choice buttons (layouts, grades, preset shots) ---------------
+
+  function buildChoices(el, items, current, onPick) {
+    el.innerHTML = "";
+    items.forEach(function (item) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = item.name;
+      if (item.id === current) b.classList.add("active");
+      b.addEventListener("click", function () { onPick(item.id); });
+      el.appendChild(b);
     });
-    els.gradeList.appendChild(button);
   }
-}
 
-function refreshPanelChips() {
-  if (!els.panelChips) return;
-  els.panelChips.innerHTML = '';
-  const count = visiblePanelCount(state);
-  for (let i = 0; i < count; i += 1) {
-    const chip = document.createElement('button');
-    chip.type = 'button';
-    chip.className = 'chip' + (i === state.selectedPanel ? ' picked' : '');
-    const photo = state.panels[i].photoId;
-    chip.textContent = photo ? `Panel ${i + 1} · ${photo}` : `Panel ${i + 1} · empty`;
-    chip.addEventListener('click', () => {
+  function refreshChoices() {
+    buildChoices($("layout-buttons"), LCMLayouts.LAYOUTS, state.layout, function (id) {
+      state.layout = id;
+      buildPanelRows();
+      store.emit();
+    });
+    buildChoices($("grade-buttons"), LCMGrades.GRADES, state.grade, function (id) {
+      state.grade = id;
+      refreshChoices();
+      store.emit();
+    });
+  }
+
+  // --- per-panel rows -------------------------------------------------
+
+  function buildPanelRows() {
+    var wrap = $("panel-list");
+    wrap.innerHTML = "";
+    var count = LCMLayouts.byId(state.layout).panels().length;
+    for (var i = 0; i < count; i++) wrap.appendChild(panelRow(i));
+    $("fill-photo").innerHTML = photoOptions(state.fillPhoto);
+  }
+
+  function photoOptions(selected) {
+    var html = "";
+    state.photos.forEach(function (p, i) {
+      html += '<option value="' + i + '"' + (i === selected ? " selected" : "") + ">" +
+        escapeHtml(p.name) + "</option>";
+    });
+    return html;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>""]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function panelRow(i) {
+    var panel = state.panels[i];
+    var row = document.createElement("div");
+    row.className = "panel-row" + (state.selectedPanel === i ? " selected" : "");
+
+    var head = document.createElement("button");
+    head.type = "button";
+    head.className = "panel-head";
+    head.textContent = "Panel " + (i + 1);
+    head.addEventListener("click", function () {
       state.selectedPanel = i;
-      syncZoomSlider();
-      refreshPanelChips();
+      buildPanelRows();
     });
-    els.panelChips.appendChild(chip);
-  }
-}
+    row.appendChild(head);
 
-function buildSampleRow() {
-  els.sampleRow.innerHTML = '';
-  for (const sample of SAMPLE_PHOTOS) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'mini';
-    button.textContent = sample.label;
-    button.addEventListener('click', async () => {
-      await library.loadSample(sample.id);
-      assignPhoto(state, state.selectedPanel, sample.id);
-      setStatus(`${sample.label} placed on panel ${state.selectedPanel + 1}.`);
-      requestRender();
+    var select = document.createElement("select");
+    select.innerHTML = '<option value="-1">Auto photo</option>' + photoOptions(panel.photo);
+    select.value = String(panel.photo);
+    select.addEventListener("change", function () {
+      panel.photo = parseInt(select.value, 10);
+      store.emit();
     });
-    els.sampleRow.appendChild(button);
-  }
-}
+    row.appendChild(select);
 
-function buildExportRow() {
-  els.exportRow.innerHTML = '';
-  for (const size of EXPORT_SIZES) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'export-button';
-    button.textContent = `${size.label} · ${size.width}×${size.height} PNG`;
-    button.addEventListener('click', () => {
-      exportCoverPNG(state, library, size);
-      setStatus(`Exported a ${size.width}×${size.height} PNG.`);
+    var zoom = document.createElement("input");
+    zoom.type = "range";
+    zoom.min = "1"; zoom.max = "2.5"; zoom.step = "0.01";
+    zoom.value = String(panel.zoom);
+    zoom.title = "Panel zoom";
+    zoom.addEventListener("input", function () {
+      panel.zoom = parseFloat(zoom.value);
+      store.emit();
     });
-    els.exportRow.appendChild(button);
+    row.appendChild(zoom);
+
+    var file = document.createElement("input");
+    file.type = "file";
+    file.accept = "image/*";
+    file.addEventListener("change", function () {
+      if (!file.files.length) return;
+      LCMPhotos.photoFromFile(file.files[0]).then(function (p) {
+        state.photos.push(p);
+        panel.photo = state.photos.length - 1;
+        buildPanelRows();
+        store.emit();
+      });
+    });
+    row.appendChild(file);
+    return row;
   }
-}
 
-function syncZoomSlider() {
-  const panel = state.panels[state.selectedPanel];
-  els.zoomRange.value = String(panel ? panel.zoom : 1);
-}
+  // --- drag to pan the selected panel ---------------------------------
 
-// --- events -------------------------------------------------------------
-
-function bindEvents() {
-  els.photoInput.addEventListener('change', async () => {
-    const ids = await library.addFiles(els.photoInput.files);
-    if (ids.length > 0) {
-      assignPhoto(state, state.selectedPanel, ids[0]);
-      for (let i = 1; i < ids.length; i += 1) {
-        assignPhoto(state, state.selectedPanel + i, ids[i]);
-      }
-      setStatus(`Loaded ${ids.length} photo${ids.length === 1 ? '' : 's'} from this machine.`);
-      requestRender();
-    }
-    els.photoInput.value = '';
+  var dragging = null;
+  stage.addEventListener("pointerdown", function (ev) {
+    dragging = { x: ev.clientX, y: ev.clientY };
+    stage.setPointerCapture(ev.pointerId);
   });
-
-  els.singlePhoto.addEventListener('change', () => {
-    state.singlePhoto = els.singlePhoto.checked;
-    if (state.singlePhoto) {
-      const first = state.panels.map((panel) => panel.photoId).find(Boolean);
-      if (first) assignPhoto(state, 0, first);
-    }
-    requestRender();
+  stage.addEventListener("pointermove", function (ev) {
+    if (!dragging) return;
+    var panel = state.panels[state.selectedPanel];
+    var rect = stage.getBoundingClientRect();
+    panel.panX = clamp(panel.panX - (ev.clientX - dragging.x) / rect.width * 1.6, -1, 1);
+    panel.panY = clamp(panel.panY - (ev.clientY - dragging.y) / rect.height * 1.6, -1, 1);
+    dragging = { x: ev.clientX, y: ev.clientY };
+    store.emit();
   });
+  stage.addEventListener("pointerup", function () { dragging = null; });
 
-  els.gradeStrength.addEventListener('input', () => {
-    state.gradeStrength = Number(els.gradeStrength.value);
-    requestRender();
-  });
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-  els.titleInput.addEventListener('input', () => {
-    state.title = els.titleInput.value;
-    requestRender();
-  });
-  els.subtitleInput.addEventListener('input', () => {
-    state.subtitle = els.subtitleInput.value;
-    requestRender();
-  });
+  // --- the rest of the form -------------------------------------------
 
-  const decoBindings = [
-    ['decoSun', 'sun'],
-    ['decoPalms', 'palms'],
-    ['decoSparkles', 'sparkles'],
-  ];
-  for (const [id, key] of decoBindings) {
-    els[id].addEventListener('change', () => {
-      state.decorations[key] = els[id].checked;
-      requestRender();
+  function bindForm() {
+    $("intensity").addEventListener("input", function () {
+      state.intensity = parseFloat(this.value);
+      store.emit();
+    });
+    $("title1").addEventListener("input", function () {
+      state.titleLines[0] = this.value;
+      store.emit();
+    });
+    $("title2").addEventListener("input", function () {
+      state.titleLines[1] = this.value;
+      store.emit();
+    });
+    $("subtitle").addEventListener("input", function () {
+      state.subtitle = this.value;
+      store.emit();
+    });
+    $("fill-all").addEventListener("change", function () {
+      state.fillAll = this.checked;
+      store.emit();
+    });
+    $("fill-photo").addEventListener("change", function () {
+      state.fillPhoto = parseInt(this.value, 10);
+      store.emit();
+    });
+    ["sun", "palms", "sparkles"].forEach(function (key) {
+      $("dec-" + key).addEventListener("change", function () {
+        state.decorations[key] = this.checked;
+        store.emit();
+      });
+    });
+    $("add-photos").addEventListener("change", function () {
+      if (!this.files.length) return;
+      LCMPhotos.photosFromFileList(this.files).then(function (added) {
+        state.photos = state.photos.concat(added);
+        buildPanelRows();
+        store.emit();
+      });
+    });
+    $("export-size").addEventListener("change", function () {
+      state.exportSize = this.value;
+    });
+    $("export-btn").addEventListener("click", function () {
+      LCMExporter.exportPNG(state, state.exportSize);
+    });
+    $("shot-buttons").querySelectorAll("button").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var shot = LCMShots.byId(b.getAttribute("data-shot"));
+        if (!shot) return;
+        store.applyShot(shot, function (name) {
+          for (var i = 0; i < state.photos.length; i++) {
+            if (state.photos[i].name === name) return i;
+          }
+          return 0;
+        });
+        syncForm();
+        buildPanelRows();
+        refreshChoices();
+      });
     });
   }
 
-  els.zoomRange.addEventListener('input', () => {
-    const panel = state.panels[state.selectedPanel];
-    if (!panel) return;
-    panel.zoom = Number(els.zoomRange.value);
-    clampPanel(panel);
-    requestRender();
-  });
-
-  // Drag on the canvas pans the panel under the pointer; a plain click
-  // selects it. Dropping files anywhere on the canvas loads them.
-  let drag = null;
-  els.coverCanvas.addEventListener('pointerdown', (event) => {
-    const rect = els.coverCanvas.getBoundingClientRect();
-    const nx = (event.clientX - rect.left) / rect.width;
-    const ny = (event.clientY - rect.top) / rect.height;
-    const index = panelIndexAt(getLayout(state.layoutId), nx, ny);
-    if (index === -1) return;
-    state.selectedPanel = index;
-    syncZoomSlider();
-    refreshPanelChips();
-    drag = { x: event.clientX, y: event.clientY, index };
-    els.coverCanvas.setPointerCapture(event.pointerId);
-  });
-  els.coverCanvas.addEventListener('pointermove', (event) => {
-    if (!drag) return;
-    const rect = els.coverCanvas.getBoundingClientRect();
-    const panel = state.panels[drag.index];
-    panel.panX += ((event.clientX - drag.x) / rect.width) * 2;
-    panel.panY += ((event.clientY - drag.y) / rect.height) * 2;
-    clampPanel(panel);
-    drag.x = event.clientX;
-    drag.y = event.clientY;
-    requestRender();
-  });
-  els.coverCanvas.addEventListener('pointerup', () => {
-    drag = null;
-  });
-  els.coverCanvas.addEventListener('dragover', (event) => event.preventDefault());
-  els.coverCanvas.addEventListener('drop', async (event) => {
-    event.preventDefault();
-    const ids = await library.addFiles(event.dataTransfer.files);
-    if (ids.length > 0) {
-      assignPhoto(state, state.selectedPanel, ids[0]);
-      requestRender();
-    }
-  });
-}
-
-// --- shot staging -------------------------------------------------------
-
-async function stageShot(shot) {
-  state = stateFromShot(shot);
-  await library.loadAllSamples();
-  els.titleInput.value = state.title;
-  els.subtitleInput.value = state.subtitle;
-  els.gradeStrength.value = String(state.gradeStrength);
-  els.decoSun.checked = state.decorations.sun;
-  els.decoPalms.checked = state.decorations.palms;
-  els.decoSparkles.checked = state.decorations.sparkles;
-  buildLayoutList();
-  buildGradeList();
-  if (shot.kind === 'export') {
-    fitPreviewToShape(shot.exportWidth, shot.exportHeight);
-    document.body.classList.add('shot-mode');
-  }
-  syncZoomSlider();
-  render();
-  setStatus(`Staged shot ${shot.file}: ${shot.title}.`);
-}
-
-// --- boot ---------------------------------------------------------------
-
-async function boot() {
-  grabElements();
-  buildSampleRow();
-  buildExportRow();
-  bindEvents();
-
-  // The Anton face must be ready before the first caption is drawn, or
-  // the lettering falls back to a system sans for one frame.
-  try {
-    await document.fonts.load('64px Anton');
-  } catch {
-    // A failed font load leaves the fallback in place; the app still works.
+  function syncForm() {
+    $("intensity").value = String(state.intensity);
+    $("title1").value = state.titleLines[0] || "";
+    $("title2").value = state.titleLines[1] || "";
+    $("subtitle").value = state.subtitle;
+    $("fill-all").checked = state.fillAll;
+    $("dec-sun").checked = state.decorations.sun;
+    $("dec-palms").checked = state.decorations.palms;
+    $("dec-sparkles").checked = state.decorations.sparkles;
+    $("export-size").value = state.exportSize;
   }
 
-  const shotFile = new URLSearchParams(location.search).get('shot');
-  const shot = SHOT_LIST.find((entry) => entry.file === shotFile);
-  if (shot) {
-    await stageShot(shot);
-    return;
-  }
+  // --- boot -------------------------------------------------------------
 
-  await library.loadAllSamples();
-  state.panels[0].photoId = 'pier';
-  state.panels[1].photoId = 'boulevard';
-  state.panels[2].photoId = 'pier';
-  state.panels[3].photoId = 'boulevard';
-  state.panels[4].photoId = 'boulevard';
-  state.panels[5].photoId = 'pier';
-  fitPreviewToShape(1080, 1350);
-  buildLayoutList();
-  buildGradeList();
-  syncZoomSlider();
-  render();
-  setStatus('Samples loaded. Pick a panel, add your own photo, then export a PNG.');
-}
+  LCMPhotos.watchDropzone($("stage-wrap"), function (added) {
+    state.photos = state.photos.concat(added);
+    buildPanelRows();
+    store.emit();
+  });
 
-boot();
+  bindForm();
+  refreshChoices();
+  buildPanelRows();
+  repaint();
+
+  LCMPhotos.loadSamples().then(function (samples) {
+    state.photos = samples;
+    buildPanelRows();
+    // The bundled face has to arrive before the first true paint, or
+    // the caption flashes in a fallback font.
+    var ready = (document.fonts && document.fonts.load)
+      ? document.fonts.load("80px Anton") : Promise.resolve(null);
+    return ready.then(function () { store.emit(); });
+  }).catch(function () { store.emit(); });
+})();

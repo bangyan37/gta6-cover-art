@@ -1,712 +1,496 @@
-// Leonida Cover Maker — the hand-in program (Node 22, standard library
-// only, no installs, no network).
+// main.ts - Leonida Cover Maker, headless edition.
 //
-// What it does, in order:
-//   1. Renders the entry's four screenshots itself, headlessly. The
-//      render is a small software pipeline written below: a progressive
-//      JPEG decoder for the bundled sample photos, a rasteriser that
-//      cuts the shared panel layouts (app/src/layouts.js), grades pixels
-//      with the shared grade definitions (app/src/grades.js), draws the
-//      decorations, and letters the captions with the bundled Anton
-//      typeface, parsed and rasterised from app/fonts/Anton-Regular.ttf.
-//      The shot list itself is shared with the app (app/src/shots.js).
-//      Fresh JPEG bytes go to screenshots/ in this repository (best
-//      effort: the grader's copy of the repository is read-only, and
-//      there the committed screenshots are already these same bytes).
-//   2. Copies app/ into the output directory and writes the rendered
-//      screenshots into its screenshots/.
-//   3. Writes dossier.json with buildDossier from vendor/makefun-app.ts,
-//      the summary the judge reads.
+//   node main.ts
 //
-// Run it locally with:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// With no MAKEFUN_OUTPUT_DIR it writes to /output when that directory
-// exists (the grader) and to ./out otherwise. `node serve.ts` serves the
-// app itself for trying in a browser.
+// Regenerates the four screenshots in screenshots/ from the shot
+// definitions the web app itself uses (app/src/shots.js, layouts and
+// grades likewise shared). Everything is standard-library Node: the
+// bundled sample photos are progressive JPEGs, so this file carries
+// its own progressive JPEG decoder and encoder, and the caption is
+// set with its own TrueType rasteriser reading the bundled Anton
+// (app/fonts/Anton-Regular.ttf). Output is deterministic: fixed
+// encoder settings, no clocks, no randomness - two runs produce
+// byte-identical files.
 
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildDossier } from './vendor/makefun-app.ts';
-import { getLayout, panelBounds } from './app/src/layouts.js';
-import { getGrade } from './app/src/grades.js';
-import { SHOT_LIST } from './app/src/shots.js';
+"use strict";
 
-const here = fileURLToPath(new URL('.', import.meta.url));
+const fs = require("node:fs");
+const path = require("node:path");
 
-// ---------------------------------------------------------------------------
-// JPEG decoding (baseline and progressive, ITU T.81)
-//
-// The bundled sample photos are progressive JPEGs, and Node's standard
-// library has no image codec, so the program carries its own decoder. It
-// parses the marker stream, rebuilds every component's coefficient
-// blocks scan by scan (DC first and refinement, AC first and refinement,
-// restart intervals, EOB runs), then inverse-transforms the blocks into
-// component planes and blends them into one RGB raster.
-// ---------------------------------------------------------------------------
+const ROOT = __dirname;
+const { SHOTS } = require("./app/src/shots.js");
+const Layouts = require("./app/src/layouts.js");
+const Grades = require("./app/src/grades.js");
+
+// ---------------------------------------------------------------------
+// JPEG decoding (baseline + progressive, Huffman, 4:4:4 / 4:2:2 / 4:2:0)
+// ---------------------------------------------------------------------
 
 const ZIGZAG = [
-  0, 1, 8, 16, 9, 2, 3, 10,
-  17, 24, 32, 25, 18, 11, 4, 5,
-  12, 19, 26, 33, 40, 48, 41, 34,
-  27, 20, 13, 6, 7, 14, 21, 28,
-  35, 42, 49, 56, 57, 50, 43, 36,
-  29, 22, 15, 23, 30, 37, 44, 51,
-  58, 59, 52, 45, 38, 31, 39, 46,
-  53, 60, 61, 54, 47, 55, 62, 63,
+  0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+  12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14,
+  21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23,
+  30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60,
+  61, 54, 47, 55, 62, 63
 ];
 
-// Cosine table for the separable IDCT: COS[j][k] already carries the
-// C(k)/2 factor, so applying it down the columns and then across the
-// rows yields the exact 1/4-scaled inverse transform the format defines.
-const IDCT_COS = [];
-for (let j = 0; j < 8; j += 1) {
-  const row = [];
-  for (let k = 0; k < 8; k += 1) {
-    const scale = k === 0 ? Math.SQRT1_2 : 1;
-    row.push((scale / 2) * Math.cos(((2 * j + 1) * k * Math.PI) / 16));
+function makeHuffman(lengths, symbols) {
+  // Canonical Huffman with the first code and first symbol index of
+  // each length precomputed, so decoding is a short walk over bits.
+  const firstCode = [], firstIndex = [];
+  let code = 0, index = 0;
+  for (let len = 1; len <= 16; len++) {
+    firstCode.push(code);
+    firstIndex.push(index);
+    index += lengths[len - 1];
+    code = (code + lengths[len - 1]) << 1;
   }
-  IDCT_COS.push(row);
+  return { lengths, symbols, firstCode, firstIndex };
 }
 
-// A bit reader over entropy-coded data. It undoes the 0xFF00 byte
-// stuffing on the fly; when a marker shows up where a data byte was
-// expected it stops feeding real bits (the scan's decoders always know
-// exactly how many MCUs a scan holds, so padding is never consumed).
 class BitReader {
-  constructor(bytes, start) {
-    this.bytes = bytes;
+  constructor(buf, start, end) {
+    this.buf = buf;
     this.pos = start;
+    this.end = end;
+    this.acc = 0;      // bit accumulator
+    this.bits = 0;     // valid bits in acc
+    this.marker = -1;  // pending marker byte (after 0xFF), or -1
+  }
+  // Next data byte, unstuffing FF00 and parking real markers.
+  nextByte() {
+    if (this.pos >= this.end) return 0xFF;
+    const b = this.buf[this.pos];
+    if (b !== 0xFF) { this.pos++; return b; }
+    const n = this.pos + 1 < this.end ? this.buf[this.pos + 1] : 0;
+    if (n === 0x00) { this.pos += 2; return 0xFF; }
+    if (n === 0xFF) { this.pos++; return 0xFF; } // fill byte
+    this.marker = n; // leave pos on the 0xFF; padding bits are 1s
+    return 0xFF;
+  }
+  fill() {
+    while (this.bits <= 16) {
+      const b = this.nextByte();
+      this.acc = (this.acc << 8) | b;
+      this.bits += 8;
+    }
+  }
+  read(n) {
+    if (n === 0) return 0;
+    this.fill();
+    this.bits -= n;
+    return (this.acc >>> this.bits) & ((1 << n) - 1);
+  }
+  readBit() { return this.read(1); }
+  // At a restart boundary: drop the partial byte and step over the
+  // RST marker if one is parked.
+  restart() {
+    this.bits = 0;
     this.acc = 0;
-    this.accBits = 0;
-    this.exhausted = false;
-  }
-
-  refill() {
-    if (this.pos >= this.bytes.length) {
-      this.exhausted = true;
-      this.acc = 0xff;
-      this.accBits = 8;
-      return;
+    if (this.marker >= 0xD0 && this.marker <= 0xD7) {
+      this.pos += 2;
+      this.marker = -1;
     }
-    const byte = this.bytes[this.pos];
-    if (byte === 0xff) {
-      const next = this.pos + 1 < this.bytes.length ? this.bytes[this.pos + 1] : 0;
-      if (next === 0x00) {
-        this.pos += 2;
-        this.acc = 0xff;
-        this.accBits = 8;
-        return;
-      }
-      // A marker (restart or the next segment) begins here: leave pos on
-      // the 0xFF so alignToRestart can consume it, and feed ones.
-      this.exhausted = true;
-      this.acc = 0xff;
-      this.accBits = 8;
-      return;
-    }
-    this.pos += 1;
-    this.acc = byte;
-    this.accBits = 8;
   }
-
-  bit() {
-    if (this.accBits === 0) this.refill();
-    this.accBits -= 1;
-    return (this.acc >> this.accBits) & 1;
-  }
-
-  bits(count) {
-    let value = 0;
-    for (let i = 0; i < count; i += 1) value = (value << 1) | this.bit();
-    return value;
-  }
-
-  // After a restart interval: drop any partial byte and step over the
-  // restart marker itself.
-  alignToRestart() {
-    this.accBits = 0;
-    this.exhausted = false;
-    if (this.bytes[this.pos] === 0xff) this.pos += 2;
-  }
-}
-
-// One Huffman table rebuilt from its DHT segment, decoded the classic
-// way: walk the code one bit at a time against each length's first code.
-class HuffmanTable {
-  constructor(counts, symbols) {
-    this.counts = counts;
-    this.symbols = symbols;
-    this.minCode = new Array(17).fill(0);
-    this.valueOffset = new Array(17).fill(0);
+  decode(table) {
     let code = 0;
-    let symbolIndex = 0;
-    for (let length = 1; length <= 16; length += 1) {
-      this.minCode[length] = code;
-      this.valueOffset[length] = symbolIndex - code;
-      symbolIndex += counts[length - 1];
-      code = (code + counts[length - 1]) << 1;
-    }
-  }
-
-  decode(reader) {
-    let code = 0;
-    for (let length = 1; length <= 16; length += 1) {
-      code = (code << 1) | reader.bit();
-      if (code - this.minCode[length] < this.counts[length - 1]) {
-        return this.symbols[this.valueOffset[length] + code];
+    for (let len = 1; len <= 16; len++) {
+      code = (code << 1) | this.readBit();
+      const count = table.lengths[len - 1];
+      const base = table.firstCode[len - 1];
+      if (count > 0 && code >= base && code < base + count) {
+        return table.symbols[table.firstIndex[len - 1] + (code - base)];
       }
     }
-    throw new Error('invalid Huffman code in JPEG scan');
+    throw new Error("bad Huffman code");
   }
 }
 
-// receive-and-extend: turn a magnitude category plus its extra bits into
-// a signed difference.
-function extend(value, size) {
-  if (size === 0) return 0;
-  if (value < 1 << (size - 1)) return value - (1 << size) + 1;
-  return value;
+function extend(v, n) {
+  // JPEG sign extension for a received n-bit value.
+  if (v < (1 << (n - 1))) return v - ((1 << n) - 1);
+  return v;
 }
 
-function decodeBaselineBlock(reader, component, block) {
-  const dcTable = component.dcTable;
-  const acTable = component.acTable;
-  const size = dcTable.decode(reader);
-  component.dcPrediction += extend(reader.bits(size), size);
-  block[0] = component.dcPrediction;
-  let k = 1;
-  while (k < 64) {
-    const rs = acTable.decode(reader);
-    const run = rs >> 4;
-    const magnitude = rs & 15;
-    if (magnitude === 0) {
-      if (run === 15) {
+function parseJPEG(buf) {
+  const frame = { w: 0, h: 0, comps: [], progressive: false };
+  const qtables = {};
+  const htables = { dc: {}, ac: {} };
+  let restartInterval = 0;
+  let i = 2; // skip SOI
+  const scans = [];
+  while (i < buf.length - 1) {
+    if (buf[i] !== 0xFF) { i++; continue; }
+    const m = buf[i + 1];
+    if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+    if (m === 0xD9) break;
+    const len = buf.readUInt16BE(i + 2);
+    const seg = i + 4, segEnd = i + 2 + len;
+    if (m === 0xDB) {
+      let p = seg;
+      while (p < segEnd) {
+        const pq = buf[p] >> 4, tq = buf[p] & 15;
+        const size = pq === 0 ? 1 : 2;
+        const table = new Int32Array(64);
+        for (let k = 0; k < 64; k++) {
+          table[ZIGZAG[k]] = size === 1 ? buf[p + 1 + k] : buf.readUInt16BE(p + 1 + k * 2);
+        }
+        qtables[tq] = table;
+        p += 1 + 64 * size;
+      }
+    } else if (m === 0xC4) {
+      let p = seg;
+      while (p < segEnd) {
+        const cls = buf[p] >> 4, id = buf[p] & 15;
+        const lengths = Array.from(buf.subarray(p + 1, p + 17));
+        const total = lengths.reduce((a, b) => a + b, 0);
+        const symbols = Array.from(buf.subarray(p + 17, p + 17 + total));
+        (cls === 0 ? htables.dc : htables.ac)[id] = makeHuffman(lengths, symbols);
+        p += 17 + total;
+      }
+    } else if (m === 0xC0 || m === 0xC2) {
+      frame.progressive = m === 0xC2;
+      frame.h = buf.readUInt16BE(seg + 1);
+      frame.w = buf.readUInt16BE(seg + 3);
+      const n = buf[seg + 5];
+      let hmax = 1, vmax = 1;
+      for (let c = 0; c < n; c++) {
+        const id = buf[seg + 6 + c * 3];
+        const hv = buf[seg + 7 + c * 3];
+        const comp = { id, h: hv >> 4, v: hv & 15, tq: buf[seg + 8 + c * 3] };
+        frame.comps.push(comp);
+        if (comp.h > hmax) hmax = comp.h;
+        if (comp.v > vmax) vmax = comp.v;
+      }
+      frame.hmax = hmax; frame.vmax = vmax;
+      for (const comp of frame.comps) {
+        comp.blocksWide = Math.ceil(frame.w * comp.h / hmax / 8);
+        comp.blocksHigh = Math.ceil(frame.h * comp.v / vmax / 8);
+        comp.coefs = new Int32Array(comp.blocksWide * comp.blocksHigh * 64);
+        comp.pred = 0;
+      }
+    } else if (m === 0xDD) {
+      restartInterval = buf.readUInt16BE(seg);
+    } else if (m === 0xDA) {
+      const ns = buf[seg];
+      const scomps = [];
+      for (let c = 0; c < ns; c++) {
+        const id = buf[seg + 1 + c * 2];
+        const tt = buf[seg + 2 + c * 2];
+        scomps.push({ comp: frame.comps.find((x) => x.id === id), td: tt >> 4, ta: tt & 15 });
+      }
+      const ss = buf[seg + 1 + ns * 2], se = buf[seg + 2 + ns * 2];
+      const ah = buf[seg + 3 + ns * 2] >> 4, al = buf[seg + 3 + ns * 2] & 15;
+      // scan data runs until the next real marker
+      let j = segEnd;
+      while (j < buf.length - 1) {
+        if (buf[j] === 0xFF && buf[j + 1] !== 0x00 && buf[j + 1] !== 0xFF) break;
+        j += buf[j] === 0xFF ? 2 : 1;
+      }
+      // Snapshot the Huffman tables as they stand at this scan:
+      // encoders may redefine a table id between scans, and later
+      // definitions must not reach back into earlier scans.
+      scans.push({
+        scomps, ss, se, ah, al, dataStart: segEnd, dataEnd: j,
+        htables: { dc: { ...htables.dc }, ac: { ...htables.ac } },
+        restartInterval
+      });
+      i = j;
+      continue;
+    }
+    i = segEnd;
+  }
+  return { frame, qtables, htables, restartInterval, scans };
+}
+
+function decodeScan(scan, ctx) {
+  const { frame, qtables } = ctx;
+  const htables = scan.htables;
+  const restartInterval = scan.restartInterval;
+  const br = new BitReader(ctx.buf, scan.dataStart, scan.dataEnd);
+  const interleaved = scan.scomps.length > 1;
+  let eobrun = 0;
+
+  function correct(coefs, base, k, p1) {
+    // One correction bit for an already-nonzero coefficient.
+    const idx = base + k;
+    if (br.readBit() && (coefs[idx] & p1) === 0) {
+      coefs[idx] += coefs[idx] > 0 ? p1 : -p1;
+    }
+  }
+
+  function decodeBlockDCFirst(sc, blockIdx) {
+    const coefs = sc.comp.coefs;
+    const s = br.decode(htables.dc[sc.td]);
+    let diff = 0;
+    if (s > 0) diff = extend(br.read(s), s);
+    sc.comp.pred += diff;
+    coefs[blockIdx * 64] = sc.comp.pred << scan.al;
+  }
+
+  function decodeBlockDCRefine(sc, blockIdx) {
+    const coefs = sc.comp.coefs;
+    const p1 = 1 << scan.al;
+    const idx = blockIdx * 64;
+    if (br.readBit() && (coefs[idx] & p1) === 0) {
+      coefs[idx] += coefs[idx] >= 0 ? p1 : -p1;
+    }
+  }
+
+  function decodeBlockACFirst(sc, blockIdx) {
+    const coefs = sc.comp.coefs;
+    const base = blockIdx * 64;
+    if (eobrun > 0) { eobrun--; return; }
+    let k = scan.ss;
+    while (k <= scan.se) {
+      const rs = br.decode(htables.ac[sc.ta]);
+      const r = rs >> 4, s = rs & 15;
+      if (s === 0) {
+        if (r < 15) { eobrun = (1 << r) + br.read(r) - 1; return; }
         k += 16;
         continue;
       }
-      break; // End of block.
-    }
-    k += run;
-    if (k > 63) break;
-    block[ZIGZAG[k]] = extend(reader.bits(magnitude), magnitude);
-    k += 1;
-  }
-}
-
-// Progressive scans keep a shared EOB-run counter on the scan state:
-// when it is positive, whole blocks carry no new coefficients, only
-// refinement bits for the ones they already hold.
-function refineExistingCoefficient(reader, block, zigIndex, approxBit) {
-  if (reader.bit() === 1 && (block[zigIndex] & approxBit) === 0) {
-    block[zigIndex] += block[zigIndex] >= 0 ? approxBit : -approxBit;
-  }
-}
-
-// Block storage is padded to whole MCUs (see decodeJpeg), so a linear
-// block index in raster order over the unpadded grid maps through the
-// padded stride.
-function blockAt(component, linearIndex) {
-  const bx = linearIndex % component.blocksWide;
-  const by = Math.floor(linearIndex / component.blocksWide);
-  return component.blocks[by * component.paddedWide + bx];
-}
-
-function partBlock(part, bx, by) {
-  const { component } = part;
-  const x = part.mcuX * part.h + bx;
-  const y = part.mcuY * part.v + by;
-  return component.blocks[y * component.paddedWide + x];
-}
-
-function decodeDcFirst(reader, scan, mcuCount) {
-  const approxShift = scan.al;
-  for (let mcu = 0; mcu < mcuCount; mcu += 1) {
-    if (scan.restartInterval > 0 && mcu > 0 && mcu % scan.restartInterval === 0) {
-      reader.alignToRestart();
-      for (const part of scan.parts) part.component.dcPrediction = 0;
-    }
-    for (const part of scan.parts) {
-      const { component } = part;
-      for (let by = 0; by < part.v; by += 1) {
-        for (let bx = 0; bx < part.h; bx += 1) {
-          const block = partBlock(part, bx, by);
-          const size = component.dcTable.decode(reader);
-          // DC coefficients are coded as differences from the previous
-          // block of the same component in the scan.
-          component.dcPrediction += extend(reader.bits(size), size);
-          block[0] = component.dcPrediction << approxShift;
-        }
-      }
-    }
-    advanceScanParts(scan);
-  }
-}
-
-function decodeDcRefine(reader, scan, mcuCount) {
-  const approxBit = 1 << scan.al;
-  for (let mcu = 0; mcu < mcuCount; mcu += 1) {
-    if (scan.restartInterval > 0 && mcu > 0 && mcu % scan.restartInterval === 0) {
-      reader.alignToRestart();
-    }
-    for (const part of scan.parts) {
-      for (let by = 0; by < part.v; by += 1) {
-        for (let bx = 0; bx < part.h; bx += 1) {
-          const block = partBlock(part, bx, by);
-          if (reader.bit() === 1 && (block[0] & approxBit) === 0) {
-            block[0] += block[0] >= 0 ? approxBit : -approxBit;
-          }
-        }
-      }
-    }
-    advanceScanParts(scan);
-  }
-}
-
-function decodeAcFirst(reader, scan, blockCount) {
-  const part = scan.parts[0];
-  const { component } = part;
-  const approxShift = scan.al;
-  let eobRun = 0;
-  for (let index = 0; index < blockCount; index += 1) {
-    if (scan.restartInterval > 0 && index > 0 && index % scan.restartInterval === 0) {
-      reader.alignToRestart();
-      eobRun = 0;
-    }
-    const block = blockAt(component, index);
-    if (eobRun > 0) {
-      eobRun -= 1;
-      continue;
-    }
-    let k = scan.ss;
-    while (k <= scan.se) {
-      const rs = component.acTable.decode(reader);
-      const run = rs >> 4;
-      const magnitude = rs & 15;
-      if (magnitude === 0) {
-        if (run === 15) {
-          k += 16;
-          continue;
-        }
-        eobRun = (1 << run) + reader.bits(run) - 1;
-        break;
-      }
-      k += run;
+      k += r;
       if (k > scan.se) break;
-      const value = extend(reader.bits(magnitude), magnitude);
-      block[ZIGZAG[k]] = value << approxShift;
-      k += 1;
+      coefs[base + ZIGZAG[k]] = extend(br.read(s), s) << scan.al;
+      k++;
     }
   }
-}
 
-function decodeAcRefine(reader, scan, blockCount) {
-  const part = scan.parts[0];
-  const { component } = part;
-  const approxBit = 1 << scan.al;
-  let eobRun = 0;
-  for (let index = 0; index < blockCount; index += 1) {
-    if (scan.restartInterval > 0 && index > 0 && index % scan.restartInterval === 0) {
-      reader.alignToRestart();
-      eobRun = 0;
-    }
-    const block = blockAt(component, index);
-    if (eobRun > 0) {
-      for (let k = scan.ss; k <= scan.se; k += 1) {
-        const zig = ZIGZAG[k];
-        if (block[zig] !== 0) refineExistingCoefficient(reader, block, zig, approxBit);
+  function decodeBlockACRefine(sc, blockIdx) {
+    const coefs = sc.comp.coefs;
+    const base = blockIdx * 64;
+    const p1 = 1 << scan.al, m1 = -p1;
+    if (eobrun > 0) {
+      eobrun--;
+      for (let k = scan.ss; k <= scan.se; k++) {
+        if (coefs[base + ZIGZAG[k]] !== 0) correct(coefs, base, ZIGZAG[k], p1);
       }
-      eobRun -= 1;
-      continue;
+      return;
     }
     let k = scan.ss;
     while (k <= scan.se) {
-      const rs = component.acTable.decode(reader);
-      const run = rs >> 4;
-      const magnitude = rs & 15;
-      if (magnitude === 0) {
-        if (run === 15) {
-          // A run of sixteen zero coefficients, refining any non-zero
-          // coefficients it passes over.
-          let zeros = 16;
-          while (zeros > 0 && k <= scan.se) {
-            const zig = ZIGZAG[k];
-            if (block[zig] !== 0) refineExistingCoefficient(reader, block, zig, approxBit);
-            else zeros -= 1;
-            k += 1;
+      const rs = br.decode(htables.ac[sc.ta]);
+      const r = rs >> 4, s = rs & 15;
+      if (s === 0) {
+        if (r < 15) {
+          eobrun = (1 << r) + br.read(r);
+          // corrections for the rest of this block's band
+          for (let kk = k; kk <= scan.se; kk++) {
+            if (coefs[base + ZIGZAG[kk]] !== 0) correct(coefs, base, ZIGZAG[kk], p1);
           }
-          continue;
+          eobrun--; // this block is the run's first member
+          return;
         }
-        eobRun = (1 << run) + reader.bits(run);
-        // The correction bits that follow belong to the coefficients
-        // this block has not processed yet in this scan: from the
-        // current position to the end of the band. (Coefficients behind
-        // the current position already sent theirs, inline, while they
-        // were being passed.)
-        for (let kk = k; kk <= scan.se; kk += 1) {
-          const zig = ZIGZAG[kk];
-          if (block[zig] !== 0) refineExistingCoefficient(reader, block, zig, approxBit);
+        // ZRL in a refinement scan: pass 16 coefficients, correcting
+        // the nonzero ones on the way.
+        let left = 16;
+        while (left > 0 && k <= scan.se) {
+          const idx = base + ZIGZAG[k];
+          if (coefs[idx] !== 0) correct(coefs, base, ZIGZAG[k], p1);
+          else left--;
+          k++;
         }
-        eobRun -= 1;
-        break;
-      }
-      if (magnitude !== 1) throw new Error('bad magnitude in AC refinement scan');
-      // The sign bit follows the same convention as extend(): a set bit
-      // means the new coefficient is positive.
-      const sign = reader.bit() === 1 ? 1 : -1;
-      let zeros = run;
-      while (k <= scan.se) {
-        const zig = ZIGZAG[k];
-        if (block[zig] !== 0) {
-          refineExistingCoefficient(reader, block, zig, approxBit);
-        } else if (zeros === 0) {
-          block[zig] = sign * approxBit;
-          k += 1;
-          break;
-        } else {
-          zeros -= 1;
-        }
-        k += 1;
-      }
-    }
-  }
-}
-
-// Multi-component scans walk MCUs; each part tracks its MCU position.
-// Single-component scans are handled block by block instead.
-function advanceScanParts(scan) {
-  for (const part of scan.parts) {
-    part.mcuX += 1;
-    if (part.mcuX >= scan.mcuCountX) {
-      part.mcuX = 0;
-      part.mcuY += 1;
-    }
-  }
-}
-
-function decodeBaselineScan(reader, scan, mcuCountX, mcuCountY) {
-  const totalMcus = mcuCountX * mcuCountY;
-  for (let mcu = 0; mcu < totalMcus; mcu += 1) {
-    if (scan.restartInterval > 0 && mcu > 0 && mcu % scan.restartInterval === 0) {
-      reader.alignToRestart();
-      for (const part of scan.parts) part.component.dcPrediction = 0;
-    }
-    for (const part of scan.parts) {
-      const { component } = part;
-      if (scan.parts.length === 1) {
-        // Non-interleaved: blocks arrive in plain raster order.
-        decodeBaselineBlock(reader, component, blockAt(component, mcu));
-      } else {
-        for (let by = 0; by < part.v; by += 1) {
-          for (let bx = 0; bx < part.h; bx += 1) {
-            decodeBaselineBlock(reader, component, partBlock(part, bx, by));
-          }
-        }
-      }
-    }
-    if (scan.parts.length > 1) advanceScanParts(scan);
-  }
-}
-
-// Inverse-transform one dequantised block into 8x8 samples (before the
-// +128 level shift), using the separable cosine table.
-function idctBlock(coefficients, out) {
-  const tmp = new Float64Array(64);
-  for (let r = 0; r < 8; r += 1) {
-    for (let x = 0; x < 8; x += 1) {
-      let sum = 0;
-      for (let u = 0; u < 8; u += 1) sum += IDCT_COS[x][u] * coefficients[r * 8 + u];
-      tmp[r * 8 + x] = sum;
-    }
-  }
-  for (let x = 0; x < 8; x += 1) {
-    for (let y = 0; y < 8; y += 1) {
-      let sum = 0;
-      for (let v = 0; v < 8; v += 1) sum += IDCT_COS[y][v] * tmp[v * 8 + x];
-      out[y * 8 + x] = sum;
-    }
-  }
-}
-
-// Decode a whole JPEG file (baseline or progressive) into
-// { width, height, data } with data holding RGB bytes, row by row.
-export function decodeJpeg(bytes) {
-  const readU16 = (at) => (bytes[at] << 8) | bytes[at + 1];
-  let pos = 0;
-  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error('not a JPEG file');
-  pos = 2;
-
-  const quantTables = new Map();
-  const dcTables = new Map();
-  const acTables = new Map();
-  let restartInterval = 0;
-  let frame = null;
-
-  const setupFrame = (progressive, width, height, componentSpecs) => {
-    const maxH = Math.max(...componentSpecs.map((c) => c.h));
-    const maxV = Math.max(...componentSpecs.map((c) => c.v));
-    const mcuCountX = Math.ceil(width / (8 * maxH));
-    const mcuCountY = Math.ceil(height / (8 * maxV));
-    const components = componentSpecs.map((spec) => {
-      const samplesW = Math.ceil((width * spec.h) / maxH);
-      const samplesH = Math.ceil((height * spec.v) / maxV);
-      const blocksWide = Math.ceil(samplesW / 8);
-      const blocksHigh = Math.ceil(samplesH / 8);
-      const paddedWide = mcuCountX * spec.h;
-      const paddedHigh = mcuCountY * spec.v;
-      const blocks = [];
-      for (let i = 0; i < paddedWide * paddedHigh; i += 1) blocks.push(new Int16Array(64));
-      return {
-        ...spec,
-        samplesW,
-        samplesH,
-        blocksWide,
-        blocksHigh,
-        paddedWide,
-        paddedHigh,
-        blocks,
-        dcPrediction: 0,
-        dcTable: null,
-        acTable: null,
-      };
-    });
-    return { progressive, width, height, components, mcuCountX, mcuCountY, maxH, maxV };
-  };
-
-  while (pos < bytes.length - 1) {
-    if (bytes[pos] !== 0xff) {
-      pos += 1;
-      continue;
-    }
-    const marker = bytes[pos + 1];
-    if (marker === 0xff || marker === 0x00) {
-      pos += 1;
-      continue;
-    }
-    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      pos += 2;
-      continue;
-    }
-    if (marker === 0xd9) break;
-    const segmentLength = readU16(pos + 2);
-    const segmentStart = pos + 4;
-    const segmentEnd = pos + 2 + segmentLength;
-
-    if (marker === 0xdb) {
-      // Quantisation table(s).
-      let at = segmentStart;
-      while (at < segmentEnd) {
-        const precision = bytes[at] >> 4;
-        const id = bytes[at] & 15;
-        at += 1;
-        const table = new Int32Array(64);
-        for (let i = 0; i < 64; i += 1) {
-          if (precision === 1) {
-            table[ZIGZAG[i]] = readU16(at);
-            at += 2;
-          } else {
-            table[ZIGZAG[i]] = bytes[at];
-            at += 1;
-          }
-        }
-        quantTables.set(id, table);
-      }
-    } else if (marker === 0xc4) {
-      // Huffman table(s).
-      let at = segmentStart;
-      while (at < segmentEnd) {
-        const tableClass = bytes[at] >> 4;
-        const id = bytes[at] & 15;
-        at += 1;
-        const counts = [];
-        let total = 0;
-        for (let i = 0; i < 16; i += 1) {
-          counts.push(bytes[at]);
-          total += bytes[at];
-          at += 1;
-        }
-        const symbols = [];
-        for (let i = 0; i < total; i += 1) {
-          symbols.push(bytes[at]);
-          at += 1;
-        }
-        const table = new HuffmanTable(counts, symbols);
-        if (tableClass === 0) dcTables.set(id, table);
-        else acTables.set(id, table);
-      }
-    } else if (marker === 0xdd) {
-      restartInterval = readU16(segmentStart);
-    } else if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
-      const height = readU16(segmentStart + 1);
-      const width = readU16(segmentStart + 3);
-      const count = bytes[segmentStart + 5];
-      const specs = [];
-      for (let i = 0; i < count; i += 1) {
-        const at = segmentStart + 6 + i * 3;
-        specs.push({
-          id: bytes[at],
-          h: bytes[at + 1] >> 4,
-          v: bytes[at + 1] & 15,
-          quantId: bytes[at + 2],
-        });
-      }
-      frame = setupFrame(marker === 0xc2, width, height, specs);
-    } else if (marker === 0xda) {
-      if (!frame) throw new Error('scan before frame');
-      const count = bytes[segmentStart];
-      const parts = [];
-      for (let i = 0; i < count; i += 1) {
-        const at = segmentStart + 1 + i * 2;
-        const component = frame.components.find((c) => c.id === bytes[at]);
-        component.dcTable = dcTables.get(bytes[at + 1] >> 4);
-        component.acTable = acTables.get(bytes[at + 1] & 15);
-        parts.push({ component, h: component.h, v: component.v, mcuX: 0, mcuY: 0 });
-      }
-      const spectral = segmentStart + 1 + count * 2;
-      const scan = {
-        parts,
-        ss: bytes[spectral],
-        se: bytes[spectral + 1],
-        ah: bytes[spectral + 2] >> 4,
-        al: bytes[spectral + 2] & 15,
-        restartInterval,
-        mcuCountX: frame.mcuCountX,
-        mcuCountY: frame.mcuCountY,
-      };
-      const reader = new BitReader(bytes, segmentEnd);
-      // DC predictions restart from zero at the head of every scan that
-      // carries first (non-refinement) DC data.
-      if (scan.ss === 0 && scan.ah === 0) {
-        for (const part of parts) part.component.dcPrediction = 0;
-      }
-      if (!frame.progressive) {
-        if (parts.length === 1) {
-          const only = parts[0].component;
-          decodeBaselineScan(reader, scan, only.blocksWide, only.blocksHigh);
-        } else {
-          decodeBaselineScan(reader, scan, frame.mcuCountX, frame.mcuCountY);
-        }
-      } else if (scan.ss === 0 && parts.length > 1) {
-        if (scan.ah === 0) decodeDcFirst(reader, scan, frame.mcuCountX * frame.mcuCountY);
-        else decodeDcRefine(reader, scan, frame.mcuCountX * frame.mcuCountY);
-      } else if (scan.ss === 0) {
-        decodeDcSingle(reader, scan);
-      } else if (scan.ah === 0) {
-        decodeAcFirst(reader, scan, parts[0].component.blocksWide * parts[0].component.blocksHigh);
-      } else {
-        decodeAcRefine(reader, scan, parts[0].component.blocksWide * parts[0].component.blocksHigh);
-      }
-      pos = reader.pos;
-      continue;
-    }
-    pos = segmentEnd;
-  }
-
-  if (!frame) throw new Error('no frame in JPEG file');
-  return composeRgb(frame, quantTables);
-}
-
-// A DC scan naming a single component carries one block per MCU in plain
-// raster order, whatever the component's sampling factors say.
-function decodeDcSingle(reader, scan) {
-  const { component } = scan.parts[0];
-  const total = component.blocksWide * component.blocksHigh;
-  component.dcPrediction = 0;
-  for (let index = 0; index < total; index += 1) {
-    if (scan.restartInterval > 0 && index > 0 && index % scan.restartInterval === 0) {
-      reader.alignToRestart();
-      component.dcPrediction = 0;
-    }
-    const block = blockAt(component, index);
-    if (scan.ah === 0) {
-      const size = component.dcTable.decode(reader);
-      component.dcPrediction += extend(reader.bits(size), size);
-      block[0] = component.dcPrediction << scan.al;
-    } else {
-      const approxBit = 1 << scan.al;
-      if (reader.bit() === 1 && (block[0] & approxBit) === 0) {
-        block[0] += block[0] >= 0 ? approxBit : -approxBit;
-      }
-    }
-  }
-}
-
-// Inverse-transform every component's blocks into a sample plane, then
-// blend the planes into RGB (YCbCr conversion for three components).
-function composeRgb(frame, quantTables) {
-  const planes = frame.components.map((component) => {
-    const plane = new Float32Array(component.samplesW * component.samplesH);
-    const quant = quantTables.get(component.quantId);
-    const dequantised = new Float64Array(64);
-    const samples = new Float64Array(64);
-    for (let by = 0; by < component.blocksHigh; by += 1) {
-      for (let bx = 0; bx < component.blocksWide; bx += 1) {
-        const block = component.blocks[by * component.paddedWide + bx];
-        for (let i = 0; i < 64; i += 1) dequantised[i] = block[i] * quant[i];
-        idctBlock(dequantised, samples);
-        for (let y = 0; y < 8; y += 1) {
-          const py = by * 8 + y;
-          if (py >= component.samplesH) break;
-          for (let x = 0; x < 8; x += 1) {
-            const px = bx * 8 + x;
-            if (px >= component.samplesW) break;
-            plane[py * component.samplesW + px] = samples[y * 8 + x] + 128;
-          }
-        }
-      }
-    }
-    return plane;
-  });
-
-  const { width, height } = frame;
-  const data = new Uint8ClampedArray(width * height * 3);
-  const samplePlane = (plane, component, x, y) => {
-    const fx = (x * component.samplesW) / width;
-    const fy = (y * component.samplesH) / height;
-    const x0 = Math.min(component.samplesW - 1, Math.floor(fx));
-    const y0 = Math.min(component.samplesH - 1, Math.floor(fy));
-    const x1 = Math.min(component.samplesW - 1, x0 + 1);
-    const y1 = Math.min(component.samplesH - 1, y0 + 1);
-    const tx = fx - Math.floor(fx);
-    const ty = fy - Math.floor(fy);
-    const top = plane[y0 * component.samplesW + x0] * (1 - tx) + plane[y0 * component.samplesW + x1] * tx;
-    const bottom = plane[y1 * component.samplesW + x0] * (1 - tx) + plane[y1 * component.samplesW + x1] * tx;
-    return top * (1 - ty) + bottom * ty;
-  };
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const at = (y * width + x) * 3;
-      if (planes.length === 1) {
-        const grey = samplePlane(planes[0], frame.components[0], x, y);
-        data[at] = grey;
-        data[at + 1] = grey;
-        data[at + 2] = grey;
         continue;
       }
-      const yy = samplePlane(planes[0], frame.components[0], x, y);
-      const cb = samplePlane(planes[1], frame.components[1], x, y) - 128;
-      const cr = samplePlane(planes[2], frame.components[2], x, y) - 128;
-      data[at] = yy + 1.402 * cr;
-      data[at + 1] = yy - 0.344136 * cb - 0.714136 * cr;
-      data[at + 2] = yy + 1.772 * cb;
+      if (s !== 1) throw new Error("bad size in AC refinement");
+      const sign = br.readBit() ? p1 : m1;
+      // Place a new coefficient after r still-zero coefficients.
+      let run = r;
+      while (k <= scan.se) {
+        const idx = base + ZIGZAG[k];
+        if (coefs[idx] !== 0) {
+          correct(coefs, base, ZIGZAG[k], p1);
+        } else {
+          if (run === 0) break;
+          run--;
+        }
+        k++;
+      }
+      if (k <= scan.se) {
+        coefs[base + ZIGZAG[k]] = sign;
+        k++;
+      }
     }
   }
-  return { width, height, data };
+
+  function decodeBlock(sc, blockIdx) {
+    if (scan.ss === 0) {
+      if (scan.ah === 0) decodeBlockDCFirst(sc, blockIdx);
+      else decodeBlockDCRefine(sc, blockIdx);
+      // DC-only scans carry no AC in this pass for progressive files;
+      // baseline files pack DC and AC in one scan - handled below by
+      // decodeBlockBaseline when the frame is not progressive.
+    } else {
+      if (scan.ah === 0) decodeBlockACFirst(sc, blockIdx);
+      else decodeBlockACRefine(sc, blockIdx);
+    }
+  }
+
+  function decodeBlockBaseline(sc, blockIdx) {
+    decodeBlockDCFirst(sc, blockIdx);
+    const coefs = sc.comp.coefs;
+    const base = blockIdx * 64;
+    let k = 1;
+    while (k < 64) {
+      const rs = br.decode(htables.ac[sc.ta]);
+      const r = rs >> 4, s = rs & 15;
+      if (s === 0) {
+        if (r < 15) break;
+        k += 16;
+        continue;
+      }
+      k += r;
+      if (k > 63) break;
+      coefs[base + ZIGZAG[k]] = extend(br.read(s), s);
+      k++;
+    }
+  }
+
+  const decodeOne = frame.progressive ? decodeBlock : decodeBlockBaseline;
+
+  if (interleaved) {
+    const mcusX = Math.ceil(frame.w / (8 * frame.hmax));
+    const mcusY = Math.ceil(frame.h / (8 * frame.vmax));
+    let count = 0;
+    for (let my = 0; my < mcusY; my++) {
+      for (let mx = 0; mx < mcusX; mx++) {
+        if (restartInterval > 0 && count > 0 && count % restartInterval === 0) {
+          br.restart();
+          eobrun = 0;
+          for (const sc of scan.scomps) sc.comp.pred = 0;
+        }
+        count++;
+        for (const sc of scan.scomps) {
+          for (let v = 0; v < sc.comp.v; v++) {
+            for (let h = 0; h < sc.comp.h; h++) {
+              const bx = mx * sc.comp.h + h;
+              const by = my * sc.comp.v + v;
+              if (bx < sc.comp.blocksWide && by < sc.comp.blocksHigh) {
+                decodeOne(sc, by * sc.comp.blocksWide + bx);
+              } else {
+                // Padding block past the image edge: it still has to
+                // be decoded to stay in sync, but into a scratch block
+                // so real coefficients survive; DC prediction is part
+                // of the stream, so it is saved and restored too.
+                const savedCoefs = sc.comp.coefs;
+                const savedPred = sc.comp.pred;
+                sc.comp.coefs = new Int32Array(64);
+                decodeOne(sc, 0);
+                sc.comp.coefs = savedCoefs;
+                sc.comp.pred = savedPred;
+              }
+            }
+          }
+        }
+      }
+    }
+  } else {
+    const sc = scan.scomps[0];
+    const total = sc.comp.blocksWide * sc.comp.blocksHigh;
+    for (let b = 0; b < total; b++) {
+      if (restartInterval > 0 && b > 0 && b % restartInterval === 0) {
+        br.restart();
+        eobrun = 0;
+        sc.comp.pred = 0;
+      }
+      decodeOne(sc, b);
+    }
+  }
+  void qtables;
 }
 
-// ---------------------------------------------------------------------------
-// JPEG encoding (baseline, 4:2:0)
-//
-// The screenshots are written as baseline JPEGs. Quantisation uses the
-// familiar Annex K tables scaled by quality; the Huffman tables are not
-// fixed constants but are built from the actual symbol frequencies of
-// the image being written, by a package-merge pass that keeps every
-// code at most 16 bits long, so the files stay small and the encoding
-// is fully deterministic: the same pixels always produce the same bytes.
-// ---------------------------------------------------------------------------
+// One 8x8 block: dequantise and IDCT into `out` (row-major floats).
+const COS = [];
+for (let u = 0; u < 8; u++) {
+  COS.push([]);
+  for (let x = 0; x < 8; x++) COS[u].push(Math.cos((2 * x + 1) * u * Math.PI / 16));
+}
+function idctBlock(coefs, base, qtable, out) {
+  const tmp = new Float64Array(64);
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      let sum = 0;
+      for (let u = 0; u < 8; u++) {
+        const cu = u === 0 ? Math.SQRT1_2 : 1;
+        sum += cu * coefs[base + y * 8 + u] * qtable[y * 8 + u] * COS[u][x];
+      }
+      tmp[y * 8 + x] = sum * 0.5;
+    }
+  }
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      let sum = 0;
+      for (let v = 0; v < 8; v++) {
+        const cv = v === 0 ? Math.SQRT1_2 : 1;
+        sum += cv * tmp[v * 8 + x] * COS[v][y];
+      }
+      out[y * 8 + x] = sum * 0.5 + 128;
+    }
+  }
+}
 
-const QUANT_LUMA = [
+function decodeJPEG(buf) {
+  const parsed = parseJPEG(buf);
+  const { frame, qtables } = parsed;
+  for (const scan of parsed.scans) decodeScan(scan, { ...parsed, buf });
+
+  // Assemble component planes at their own resolutions.
+  const planes = frame.comps.map((comp) => {
+    const w = comp.blocksWide * 8, h = comp.blocksHigh * 8;
+    const data = new Float64Array(w * h);
+    const block = new Float64Array(64);
+    for (let by = 0; by < comp.blocksHigh; by++) {
+      for (let bx = 0; bx < comp.blocksWide; bx++) {
+        idctBlock(comp.coefs, (by * comp.blocksWide + bx) * 64, qtables[comp.tq], block);
+        for (let y = 0; y < 8; y++) {
+          for (let x = 0; x < 8; x++) {
+            data[(by * 8 + y) * w + bx * 8 + x] = block[y * 8 + x];
+          }
+        }
+      }
+    }
+    return { w, h, data, hRatio: comp.h / frame.hmax, vRatio: comp.v / frame.vmax };
+  });
+
+  // Upsample (bilinear) to full size and convert YCbCr -> RGB.
+  const W = frame.w, H = frame.h;
+  const out = new Uint8ClampedArray(W * H * 3);
+  function sample(plane, fx, fy) {
+    const sx = Math.min(plane.w - 1, Math.max(0, fx * plane.w - 0.5));
+    const sy = Math.min(plane.h - 1, Math.max(0, fy * plane.h - 0.5));
+    const x0 = Math.floor(sx), y0 = Math.floor(sy);
+    const x1 = Math.min(plane.w - 1, x0 + 1), y1 = Math.min(plane.h - 1, y0 + 1);
+    const tx = sx - x0, ty = sy - y0;
+    const d = plane.data;
+    const top = d[y0 * plane.w + x0] * (1 - tx) + d[y0 * plane.w + x1] * tx;
+    const bot = d[y1 * plane.w + x0] * (1 - tx) + d[y1 * plane.w + x1] * tx;
+    return top * (1 - ty) + bot * ty;
+  }
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const fx = (x + 0.5) / W, fy = (y + 0.5) / H;
+      const yy = sample(planes[0], fx, fy);
+      let r = yy, g = yy, b = yy;
+      if (planes.length >= 3) {
+        const cb = sample(planes[1], fx, fy) - 128;
+        const cr = sample(planes[2], fx, fy) - 128;
+        r = yy + 1.402 * cr;
+        g = yy - 0.34414 * cb - 0.71414 * cr;
+        b = yy + 1.772 * cb;
+      }
+      const o = (y * W + x) * 3;
+      out[o] = r; out[o + 1] = g; out[o + 2] = b;
+    }
+  }
+  return { width: W, height: H, data: out };
+}
+
+// ---------------------------------------------------------------------
+// JPEG encoding (baseline, 4:2:0, standard tables, quality-scaled)
+// ---------------------------------------------------------------------
+
+const STD_LUM_Q = [
   16, 11, 10, 16, 24, 40, 51, 61,
   12, 12, 14, 19, 26, 58, 60, 55,
   14, 13, 16, 24, 40, 57, 69, 56,
@@ -714,10 +498,9 @@ const QUANT_LUMA = [
   18, 22, 37, 56, 68, 109, 103, 77,
   24, 35, 55, 64, 81, 104, 113, 92,
   49, 64, 78, 87, 103, 121, 120, 101,
-  72, 92, 95, 98, 112, 100, 103, 99,
+  72, 92, 95, 98, 112, 100, 103, 99
 ];
-
-const QUANT_CHROMA = [
+const STD_CHR_Q = [
   17, 18, 24, 47, 99, 99, 99, 99,
   18, 21, 26, 66, 99, 99, 99, 99,
   24, 26, 56, 99, 99, 99, 99, 99,
@@ -725,1217 +508,1034 @@ const QUANT_CHROMA = [
   99, 99, 99, 99, 99, 99, 99, 99,
   99, 99, 99, 99, 99, 99, 99, 99,
   99, 99, 99, 99, 99, 99, 99, 99,
-  99, 99, 99, 99, 99, 99, 99, 99,
+  99, 99, 99, 99, 99, 99, 99, 99
+];
+// Standard Annex K Huffman tables.
+const DC_L_BITS = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const DC_L_VALS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const DC_C_BITS = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const DC_C_VALS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const AC_L_BITS = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D];
+const AC_L_VALS = [
+  0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+  0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52,
+  0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25,
+  0x26, 0x27, 0x28, 0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
+  0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64,
+  0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83,
+  0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+  0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+  0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3,
+  0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8,
+  0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA
+];
+const AC_C_BITS = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+const AC_C_VALS = [
+  0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61,
+  0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33,
+  0x52, 0xF0, 0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34, 0xE1, 0x25, 0xF1, 0x17, 0x18,
+  0x19, 0x1A, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44,
+  0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63,
+  0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A,
+  0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+  0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
+  0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA,
+  0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7,
+  0xE8, 0xE9, 0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA
 ];
 
-function scaledQuantTable(base, quality) {
-  const clamped = Math.min(100, Math.max(1, quality));
-  const scale = clamped < 50 ? 5000 / clamped : 200 - 2 * clamped;
-  return base.map((value) => Math.min(255, Math.max(1, Math.floor((value * scale + 50) / 100))));
-}
-
-// Forward DCT of one 8x8 sample block (level-shifted samples in,
-// coefficients out), using the same cosine table as the decoder.
-function fdctBlock(samples, out) {
-  const tmp = new Float64Array(64);
-  for (let y = 0; y < 8; y += 1) {
-    for (let u = 0; u < 8; u += 1) {
-      let sum = 0;
-      for (let x = 0; x < 8; x += 1) sum += IDCT_COS[x][u] * samples[y * 8 + x];
-      tmp[y * 8 + u] = sum;
+function buildCodes(bits, vals) {
+  const map = new Map();
+  let code = 0, k = 0;
+  for (let len = 1; len <= 16; len++) {
+    for (let n = 0; n < bits[len - 1]; n++) {
+      map.set(vals[k++], { code, len });
+      code++;
     }
+    code <<= 1;
   }
-  for (let u = 0; u < 8; u += 1) {
-    for (let v = 0; v < 8; v += 1) {
-      let sum = 0;
-      for (let y = 0; y < 8; y += 1) sum += IDCT_COS[y][v] * tmp[y * 8 + u];
-      out[v * 8 + u] = sum;
-    }
-  }
+  return map;
 }
 
-function magnitudeCategory(value) {
-  let magnitude = Math.abs(value);
-  let category = 0;
-  while (magnitude > 0) {
-    category += 1;
-    magnitude >>= 1;
-  }
-  return category;
-}
-
-// Length-limited Huffman code lengths from symbol frequencies, by
-// package-merge: repeatedly package the two lightest adjacent entries
-// of the sorted list and merge the packages back with the leaves; after
-// (limit - 1) rounds, a symbol's code length is how often it appears in
-// the first 2n-2 entries of the final list.
-function huffmanLengths(frequencies, limit = 16) {
-  const symbols = [...frequencies.keys()].filter((s) => frequencies.get(s) > 0);
-  if (symbols.length === 0) return new Map();
-  if (symbols.length === 1) return new Map([[symbols[0], 1]]);
-  const byWeight = (a, b) => a.weight - b.weight || a.members[0] - b.members[0];
-  const leaves = symbols
-    .map((s) => ({ weight: frequencies.get(s), members: [s] }))
-    .sort(byWeight);
-  let list = leaves;
-  for (let round = 1; round < limit; round += 1) {
-    const packages = [];
-    for (let i = 0; i + 1 < list.length; i += 2) {
-      packages.push({
-        weight: list[i].weight + list[i + 1].weight,
-        members: list[i].members.concat(list[i + 1].members),
-      });
-    }
-    list = leaves.concat(packages).sort(byWeight);
-  }
-  const lengths = new Map(symbols.map((s) => [s, 0]));
-  const take = 2 * symbols.length - 2;
-  for (const item of list.slice(0, take)) {
-    for (const member of item.members) lengths.set(member, lengths.get(member) + 1);
-  }
-  return lengths;
-}
-
-// Canonical codes for a set of code lengths, plus the DHT segment body
-// (counts per length, then the symbols in code order).
-function canonicalHuffman(lengths) {
-  const entries = [...lengths.entries()]
-    .filter(([, length]) => length > 0)
-    .sort((a, b) => a[1] - b[1] || a[0] - b[0]);
-  const codes = new Map();
-  const counts = new Array(16).fill(0);
-  let code = 0;
-  let previousLength = 0;
-  for (const [symbol, length] of entries) {
-    code <<= length - previousLength;
-    codes.set(symbol, { code, length });
-    counts[length - 1] += 1;
-    code += 1;
-    previousLength = length;
-  }
-  return { codes, counts, orderedSymbols: entries.map(([symbol]) => symbol) };
+function scaleQuant(base, quality) {
+  const q = Math.max(1, Math.min(100, quality));
+  const scale = q < 50 ? 5000 / q : 200 - q * 2;
+  return base.map((v) => Math.max(1, Math.min(255, Math.floor((v * scale + 50) / 100))));
 }
 
 class BitWriter {
-  constructor() {
-    this.bytes = [];
-    this.acc = 0;
-    this.accBits = 0;
-  }
-
-  write(value, length) {
-    for (let i = length - 1; i >= 0; i -= 1) {
-      this.acc = (this.acc << 1) | ((value >> i) & 1);
-      this.accBits += 1;
-      if (this.accBits === 8) {
-        this.bytes.push(this.acc);
-        if (this.acc === 0xff) this.bytes.push(0x00);
-        this.acc = 0;
-        this.accBits = 0;
-      }
+  constructor() { this.bytes = []; this.acc = 0; this.bits = 0; }
+  write(code, len) {
+    this.acc = (this.acc << len) | code;
+    this.bits += len;
+    while (this.bits >= 8) {
+      this.bits -= 8;
+      const b = (this.acc >>> this.bits) & 0xFF;
+      this.bytes.push(b);
+      if (b === 0xFF) this.bytes.push(0);
     }
   }
-
-  finish() {
-    if (this.accBits > 0) {
-      const padded = (this.acc << (8 - this.accBits)) | ((1 << (8 - this.accBits)) - 1);
-      this.bytes.push(padded);
-      if (padded === 0xff) this.bytes.push(0x00);
-      this.acc = 0;
-      this.accBits = 0;
+  flush() {
+    if (this.bits > 0) {
+      const pad = 8 - this.bits;
+      const b = ((this.acc << pad) | ((1 << pad) - 1)) & 0xFF;
+      this.bytes.push(b);
+      if (b === 0xFF) this.bytes.push(0);
+      this.bits = 0;
     }
-    return this.bytes;
   }
 }
 
-// Encode { width, height, data } (RGB bytes) as a baseline JPEG Buffer.
-export function encodeJpeg(image, quality = 78) {
-  const { width, height } = image;
-  const quantLuma = scaledQuantTable(QUANT_LUMA, quality);
-  const quantChroma = scaledQuantTable(QUANT_CHROMA, quality);
-
-  // Colour-convert and downsample chroma 2x2 (box average).
-  const chromaWidth = Math.ceil(width / 2);
-  const chromaHeight = Math.ceil(height / 2);
-  const planeY = new Float32Array(width * height);
-  const planeCb = new Float32Array(chromaWidth * chromaHeight);
-  const planeCr = new Float32Array(chromaWidth * chromaHeight);
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const at = (y * width + x) * 3;
-      const r = image.data[at];
-      const g = image.data[at + 1];
-      const b = image.data[at + 2];
-      planeY[y * width + x] = 0.299 * r + 0.587 * g + 0.114 * b;
-    }
-  }
-  for (let cy = 0; cy < chromaHeight; cy += 1) {
-    for (let cx = 0; cx < chromaWidth; cx += 1) {
-      let cbSum = 0;
-      let crSum = 0;
-      let counted = 0;
-      for (let dy = 0; dy < 2; dy += 1) {
-        for (let dx = 0; dx < 2; dx += 1) {
-          const x = Math.min(width - 1, cx * 2 + dx);
-          const y = Math.min(height - 1, cy * 2 + dy);
-          const at = (y * width + x) * 3;
-          const r = image.data[at];
-          const g = image.data[at + 1];
-          const b = image.data[at + 2];
-          cbSum += -0.16873589 * r - 0.33126411 * g + 0.5 * b + 128;
-          crSum += 0.5 * r - 0.41868759 * g - 0.08131241 * b + 128;
-          counted += 1;
+function fdctQuant(block, qtable, out) {
+  // block: 64 level-shifted samples; out: quantised coefficients,
+  // both in natural (row-major) order.
+  for (let v = 0; v < 8; v++) {
+    for (let u = 0; u < 8; u++) {
+      let sum = 0;
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          sum += block[y * 8 + x] * COS[u][x] * COS[v][y];
         }
       }
-      planeCb[cy * chromaWidth + cx] = cbSum / counted;
-      planeCr[cy * chromaWidth + cx] = crSum / counted;
+      const cu = u === 0 ? Math.SQRT1_2 : 1;
+      const cv = v === 0 ? Math.SQRT1_2 : 1;
+      out[v * 8 + u] = Math.round(sum * 0.25 * cu * cv / qtable[v * 8 + u]);
+    }
+  }
+}
+
+function encodeJPEG(img, quality) {
+  const W = img.width, H = img.height;
+  const qLum = scaleQuant(STD_LUM_Q, quality);
+  const qChr = scaleQuant(STD_CHR_Q, quality);
+  const dcL = buildCodes(DC_L_BITS, DC_L_VALS), acL = buildCodes(AC_L_BITS, AC_L_VALS);
+  const dcC = buildCodes(DC_C_BITS, DC_C_VALS), acC = buildCodes(AC_C_BITS, AC_C_VALS);
+
+  // RGB -> YCbCr planes; chroma subsampled 2x2 by box average.
+  const yPlane = new Float64Array(W * H);
+  const cbFull = new Float64Array(W * H), crFull = new Float64Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    const r = img.data[i * 3], g = img.data[i * 3 + 1], b = img.data[i * 3 + 2];
+    yPlane[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    cbFull[i] = -0.168736 * r - 0.331264 * g + 0.5 * b + 128;
+    crFull[i] = 0.5 * r - 0.418688 * g - 0.081312 * b + 128;
+  }
+  const cw = Math.ceil(W / 2), ch = Math.ceil(H / 2);
+  const cbPlane = new Float64Array(cw * ch), crPlane = new Float64Array(cw * ch);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      let sb = 0, sr = 0, n = 0;
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          const sx = Math.min(W - 1, x * 2 + dx), sy = Math.min(H - 1, y * 2 + dy);
+          sb += cbFull[sy * W + sx]; sr += crFull[sy * W + sx]; n++;
+        }
+      }
+      cbPlane[y * cw + x] = sb / n;
+      crPlane[y * cw + x] = sr / n;
     }
   }
 
-  // Cut a plane into quantised blocks, in block raster order.
-  const quantisePlane = (plane, planeWidth, planeHeight, quant) => {
-    const blocksWide = Math.ceil(planeWidth / 8);
-    const blocksHigh = Math.ceil(planeHeight / 8);
-    const blocks = [];
-    const samples = new Float64Array(64);
-    const coefficients = new Float64Array(64);
-    for (let by = 0; by < blocksHigh; by += 1) {
-      for (let bx = 0; bx < blocksWide; bx += 1) {
-        for (let y = 0; y < 8; y += 1) {
-          const py = Math.min(planeHeight - 1, by * 8 + y);
-          for (let x = 0; x < 8; x += 1) {
-            const px = Math.min(planeWidth - 1, bx * 8 + x);
-            samples[y * 8 + x] = plane[py * planeWidth + px] - 128;
-          }
+  const bw = new BitWriter();
+  const preds = [0, 0, 0];
+  const block = new Float64Array(64);
+  const coefs = new Int32Array(64);
+
+  function encodeBlock(plane, pw, bx, by, qtable, dcMap, acMap, ci) {
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        const sx = Math.min(pw - 1, bx * 8 + x);
+        const sy = Math.min((plane === yPlane ? H : ch) - 1, by * 8 + y);
+        block[y * 8 + x] = plane[sy * pw + sx] - 128;
+      }
+    }
+    fdctQuant(block, qtable, coefs);
+    // DC
+    const diff = coefs[0] - preds[ci];
+    preds[ci] = coefs[0];
+    const size = diff === 0 ? 0 : 32 - Math.clz32(Math.abs(diff));
+    const dcSym = dcMap.get(size);
+    bw.write(dcSym.code, dcSym.len);
+    if (size > 0) {
+      bw.write(diff > 0 ? diff : diff + (1 << size) - 1, size);
+    }
+    // AC, zigzag order
+    let run = 0;
+    for (let k = 1; k < 64; k++) {
+      const val = coefs[ZIGZAG[k]];
+      if (val === 0) { run++; continue; }
+      while (run > 15) {
+        const zrl = acMap.get(0xF0);
+        bw.write(zrl.code, zrl.len);
+        run -= 16;
+      }
+      const s = 32 - Math.clz32(Math.abs(val));
+      const sym = acMap.get((run << 4) | s);
+      bw.write(sym.code, sym.len);
+      bw.write(val > 0 ? val : val + (1 << s) - 1, s);
+      run = 0;
+    }
+    if (run > 0) {
+      const eob = acMap.get(0);
+      bw.write(eob.code, eob.len);
+    }
+  }
+
+  const mcusX = Math.ceil(W / 16), mcusY = Math.ceil(H / 16);
+  for (let my = 0; my < mcusY; my++) {
+    for (let mx = 0; mx < mcusX; mx++) {
+      for (let v = 0; v < 2; v++) {
+        for (let h = 0; h < 2; h++) {
+          encodeBlock(yPlane, W, mx * 2 + h, my * 2 + v, qLum, dcL, acL, 0);
         }
-        fdctBlock(samples, coefficients);
-        const block = new Int16Array(64);
-        for (let i = 0; i < 64; i += 1) block[i] = Math.round(coefficients[i] / quant[i]);
-        blocks.push(block);
       }
+      encodeBlock(cbPlane, cw, mx, my, qChr, dcC, acC, 1);
+      encodeBlock(crPlane, cw, mx, my, qChr, dcC, acC, 2);
     }
-    return { blocks, blocksWide, blocksHigh };
-  };
+  }
+  bw.flush();
 
-  const compY = { ...quantisePlane(planeY, width, height, quantLuma), h: 2, v: 2, quant: quantLuma };
-  const compCb = { ...quantisePlane(planeCb, chromaWidth, chromaHeight, quantChroma), h: 1, v: 1, quant: quantChroma };
-  const compCr = { ...quantisePlane(planeCr, chromaWidth, chromaHeight, quantChroma), h: 1, v: 1, quant: quantChroma };
-  const components = [compY, compCb, compCr];
-  const mcuCountX = Math.ceil(width / 16);
-  const mcuCountY = Math.ceil(height / 16);
-
-  // The MCU walk shared by the counting pass and the writing pass: it
-  // visits (component, block) pairs in scan order.
-  const walkMcus = (visit) => {
-    const predictions = [0, 0, 0];
-    for (let mcuY = 0; mcuY < mcuCountY; mcuY += 1) {
-      for (let mcuX = 0; mcuX < mcuCountX; mcuX += 1) {
-        components.forEach((component, ci) => {
-          for (let by = 0; by < component.v; by += 1) {
-            for (let bx = 0; bx < component.h; bx += 1) {
-              const blockX = Math.min(component.blocksWide - 1, mcuX * component.h + bx);
-              const blockY = Math.min(component.blocksHigh - 1, mcuY * component.v + by);
-              const block = component.blocks[blockY * component.blocksWide + blockX];
-              const diff = block[0] - predictions[ci];
-              predictions[ci] = block[0];
-              visit(ci, block, diff);
-            }
-          }
-        });
-      }
-    }
-  };
-
-  // Pass 1: count symbol frequencies for the four Huffman tables.
-  const dcFreq = [new Map(), new Map()];
-  const acFreq = [new Map(), new Map()];
-  const bump = (map, symbol) => map.set(symbol, (map.get(symbol) ?? 0) + 1);
-  walkMcus((ci, block, diff) => {
-    const tableIndex = ci === 0 ? 0 : 1;
-    bump(dcFreq[tableIndex], magnitudeCategory(diff));
-    let run = 0;
-    for (let k = 1; k < 64; k += 1) {
-      const value = block[ZIGZAG[k]];
-      if (value === 0) {
-        run += 1;
-        continue;
-      }
-      while (run > 15) {
-        bump(acFreq[tableIndex], 0xf0);
-        run -= 16;
-      }
-      bump(acFreq[tableIndex], (run << 4) | magnitudeCategory(value));
-      run = 0;
-    }
-    if (run > 0) bump(acFreq[tableIndex], 0x00);
-  });
-
-  // No code word may be all ones: the format reserves that pattern and
-  // strict decoders refuse a table that hands it to a real symbol. If
-  // the canonical assignment produces one, lengthen that symbol's code
-  // by a bit (which appends a zero); it is always the last symbol in
-  // code order, so no other symbol's code moves. Lengths are built
-  // with a limit of 15 so that this lengthening, to at most 16, is
-  // always available.
-  const buildTable = (frequencies) => {
-    const lengths = huffmanLengths(frequencies, 15);
-    for (let guard = 0; guard < 24; guard += 1) {
-      const table = canonicalHuffman(lengths);
-      let offender = -1;
-      for (const [symbol, entry] of table.codes) {
-        if (entry.code === (1 << entry.length) - 1) offender = symbol;
-      }
-      if (offender === -1 || lengths.get(offender) >= 16) return table;
-      lengths.set(offender, lengths.get(offender) + 1);
-    }
-    return canonicalHuffman(lengths);
-  };
-  const dcTables = dcFreq.map(buildTable);
-  const acTables = acFreq.map(buildTable);
-
-  // Pass 2: write the entropy-coded data.
-  const writer = new BitWriter();
-  const writeSymbol = (table, symbol) => {
-    const entry = table.codes.get(symbol);
-    writer.write(entry.code, entry.length);
-  };
-  const writeValue = (value, category) => {
-    if (category === 0) return;
-    const bits = value > 0 ? value : value + (1 << category) - 1;
-    writer.write(bits, category);
-  };
-  walkMcus((ci, block, diff) => {
-    const tableIndex = ci === 0 ? 0 : 1;
-    const category = magnitudeCategory(diff);
-    writeSymbol(dcTables[tableIndex], category);
-    writeValue(diff, category);
-    let run = 0;
-    for (let k = 1; k < 64; k += 1) {
-      const value = block[ZIGZAG[k]];
-      if (value === 0) {
-        run += 1;
-        continue;
-      }
-      while (run > 15) {
-        writeSymbol(acTables[tableIndex], 0xf0);
-        run -= 16;
-      }
-      const valueCategory = magnitudeCategory(value);
-      writeSymbol(acTables[tableIndex], (run << 4) | valueCategory);
-      writeValue(value, valueCategory);
-      run = 0;
-    }
-    if (run > 0) writeSymbol(acTables[tableIndex], 0x00);
-  });
-  const entropy = writer.finish();
-
-  // Assemble the file.
   const out = [];
-  const push16 = (value) => out.push((value >> 8) & 255, value & 255);
-  const segment = (marker, body) => {
-    out.push(0xff, marker);
-    push16(body.length + 2);
-    out.push(...body);
-  };
-  out.push(0xff, 0xd8);
-  segment(0xe0, [0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
-  const quantBody = [];
-  [quantLuma, quantChroma].forEach((table, id) => {
-    quantBody.push(id);
-    for (let i = 0; i < 64; i += 1) quantBody.push(table[ZIGZAG[i]]);
-  });
-  segment(0xdb, quantBody);
-  const huffmanBody = [];
-  const addTable = (tableClass, id, table) => {
-    huffmanBody.push((tableClass << 4) | id, ...table.counts, ...table.orderedSymbols);
-  };
-  addTable(0, 0, dcTables[0]);
-  addTable(0, 1, dcTables[1]);
-  addTable(1, 0, acTables[0]);
-  addTable(1, 1, acTables[1]);
-  segment(0xc4, huffmanBody);
-  segment(0xc0, [
-    8,
-    (height >> 8) & 255, height & 255,
-    (width >> 8) & 255, width & 255,
-    3,
-    1, 0x22, 0,
-    2, 0x11, 1,
-    3, 0x11, 1,
-  ]);
-  segment(0xda, [3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
-  // The entropy data is far too large to spread into push(); join the
-  // pieces as buffers instead.
-  return Buffer.concat([Buffer.from(out), Buffer.from(entropy), Buffer.from([0xff, 0xd9])]);
-}
-
-// ---------------------------------------------------------------------------
-// The bundled Anton typeface, parsed and rasterised by this program.
-//
-// Captions in the headless screenshots are lettered with the same font
-// file the app ships (app/fonts/Anton-Regular.ttf, SIL OFL 1.1). This is
-// a small TrueType reader: it walks the table directory, maps code
-// points through the format 4 cmap, reads simple and composite glyph
-// outlines from glyf, flattens their quadratic curves into polygons,
-// and fills those polygons scanline by scanline with the nonzero
-// winding rule. It covers what the captions need — capital letters,
-// digits, spaces and basic punctuation.
-// ---------------------------------------------------------------------------
-
-function loadAntonFont(bytes) {
-  const u16 = (at) => (bytes[at] << 8) | bytes[at + 1];
-  const i16 = (at) => {
-    const value = u16(at);
-    return value >= 0x8000 ? value - 0x10000 : value;
-  };
-  const u32 = (at) => (bytes[at] * 0x1000000 + ((bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3])) >>> 0;
-
-  const tables = new Map();
-  const tableCount = u16(4);
-  for (let i = 0; i < tableCount; i += 1) {
-    const at = 12 + i * 16;
-    const tag = String.fromCharCode(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]);
-    tables.set(tag, u32(at + 8));
-  }
-  const headAt = tables.get('head');
-  const unitsPerEm = u16(headAt + 18);
-  const locaFormat = i16(headAt + 50);
-  const numGlyphs = u16(tables.get('maxp') + 4);
-  const hheaAt = tables.get('hhea');
-  const metricCount = u16(hheaAt + 34);
-  const hmtxAt = tables.get('hmtx');
-  const locaAt = tables.get('loca');
-  const glyfAt = tables.get('glyf');
-
-  const advanceOf = (glyphId) => {
-    const index = Math.min(glyphId, metricCount - 1);
-    return u16(hmtxAt + index * 4);
-  };
-  const glyphOffset = (glyphId) => {
-    if (locaFormat === 0) return u16(locaAt + glyphId * 2) * 2;
-    return u32(locaAt + glyphId * 4);
-  };
-
-  // Format 4 cmap: segment arrays with deltas and range offsets.
-  const cmapAt = tables.get('cmap');
-  let subAt = -1;
-  const subCount = u16(cmapAt + 2);
-  for (let i = 0; i < subCount; i += 1) {
-    const candidate = cmapAt + u32(cmapAt + 4 + i * 8 + 4);
-    if (u16(candidate) === 4) {
-      subAt = candidate;
-      break;
+  function marker(m2, payload) {
+    out.push(0xFF, m2);
+    if (payload) {
+      out.push((payload.length + 2) >> 8, (payload.length + 2) & 0xFF, ...payload);
     }
   }
-  const segCount = u16(subAt + 6) / 2;
-  const endCodesAt = subAt + 14;
-  const startCodesAt = endCodesAt + 2 * segCount + 2;
-  const deltasAt = startCodesAt + 2 * segCount;
-  const rangeOffsetsAt = deltasAt + 2 * segCount;
+  function quantPayload(table, id) {
+    const p = [id];
+    for (let k = 0; k < 64; k++) p.push(table[ZIGZAG[k]]);
+    return p;
+  }
+  function huffPayload(bits, vals, id) {
+    return [id, ...bits, ...vals];
+  }
+  out.push(0xFF, 0xD8);
+  marker(0xE0, [0x4A, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+  marker(0xDB, quantPayload(qLum, 0));
+  marker(0xDB, quantPayload(qChr, 1));
+  marker(0xC0, [
+    8, H >> 8, H & 0xFF, W >> 8, W & 0xFF, 3,
+    1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1
+  ]);
+  marker(0xC4, huffPayload(DC_L_BITS, DC_L_VALS, 0x00));
+  marker(0xC4, huffPayload(AC_L_BITS, AC_L_VALS, 0x10));
+  marker(0xC4, huffPayload(DC_C_BITS, DC_C_VALS, 0x01));
+  marker(0xC4, huffPayload(AC_C_BITS, AC_C_VALS, 0x11));
+  marker(0xDA, [3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
+  return Buffer.concat([
+    Buffer.from(out),
+    Buffer.from(bw.bytes),
+    Buffer.from([0xFF, 0xD9])
+  ]);
+}
 
-  function glyphIndex(codePoint) {
-    for (let s = 0; s < segCount; s += 1) {
-      const end = u16(endCodesAt + s * 2);
-      const start = u16(startCodesAt + s * 2);
-      if (codePoint < start || codePoint > end) continue;
-      const delta = i16(deltasAt + s * 2);
-      const rangeOffset = u16(rangeOffsetsAt + s * 2);
-      if (rangeOffset === 0) return (codePoint + delta) & 0xffff;
-      const glyphIdAt = rangeOffsetsAt + s * 2 + rangeOffset + 2 * (codePoint - start);
-      const glyphId = u16(glyphIdAt);
-      return glyphId === 0 ? 0 : (glyphId + delta) & 0xffff;
+// Encode at the highest quality whose output fits the byte budget;
+// the step ladder is fixed, so the choice is deterministic.
+function encodeFitting(img, budget) {
+  for (const q of [88, 84, 80, 76, 72, 68, 64, 60, 55, 50, 45, 40]) {
+    const encoded = encodeJPEG(img, q);
+    if (encoded.length <= budget) return encoded;
+  }
+  return encodeJPEG(img, 35);
+}
+
+// ---------------------------------------------------------------------
+// TrueType rasteriser (glyf outlines, quadratic curves, nonzero fill)
+// ---------------------------------------------------------------------
+
+class Font {
+  constructor(buf) {
+    this.buf = buf;
+    const numTables = buf.readUInt16BE(4);
+    this.tables = {};
+    for (let i = 0; i < numTables; i++) {
+      const off = 12 + i * 16;
+      const tag = buf.toString("ascii", off, off + 4);
+      this.tables[tag] = { off: buf.readUInt32BE(off + 8), len: buf.readUInt32BE(off + 12) };
+    }
+    const head = this.tables.head.off;
+    this.unitsPerEm = buf.readUInt16BE(this.tables.head.off + 18);
+    this.indexToLocFormat = buf.readInt16BE(head + 50);
+    this.numGlyphs = buf.readUInt16BE(this.tables.maxp.off + 4);
+    this.numHMetrics = buf.readUInt16BE(this.tables.hhea.off + 34);
+    this.parseCmap();
+  }
+  parseCmap() {
+    const base = this.tables.cmap.off;
+    const n = this.buf.readUInt16BE(base + 2);
+    let fmt4 = -1, fmt12 = -1;
+    for (let i = 0; i < n; i++) {
+      const platform = this.buf.readUInt16BE(base + 4 + i * 8);
+      const encoding = this.buf.readUInt16BE(base + 6 + i * 8);
+      const off = this.buf.readUInt32BE(base + 8 + i * 8);
+      const format = this.buf.readUInt16BE(base + off);
+      if (format === 12 && fmt12 < 0) fmt12 = base + off;
+      if (format === 4 && (platform === 3 || platform === 0) && fmt4 < 0) fmt4 = base + off;
+      void encoding;
+    }
+    this.cmap12 = fmt12;
+    this.cmap4 = fmt4;
+  }
+  glyphIndex(code) {
+    const buf = this.buf;
+    if (this.cmap12 >= 0) {
+      const base = this.cmap12;
+      const n = buf.readUInt32BE(base + 12);
+      let lo = 0, hi = n - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const off = base + 16 + mid * 12;
+        const start = buf.readUInt32BE(off), end = buf.readUInt32BE(off + 4);
+        if (code < start) hi = mid - 1;
+        else if (code > end) lo = mid + 1;
+        else return buf.readUInt32BE(off + 8) + (code - start);
+      }
+      return 0;
+    }
+    if (this.cmap4 >= 0) {
+      const base = this.cmap4;
+      const segCount = buf.readUInt16BE(base + 6) / 2;
+      const endOff = base + 14;
+      let seg = -1;
+      for (let i = 0; i < segCount; i++) {
+        if (buf.readUInt16BE(endOff + i * 2) >= code) { seg = i; break; }
+      }
+      if (seg < 0) return 0;
+      const startOff = endOff + segCount * 2 + 2;
+      const start = buf.readUInt16BE(startOff + seg * 2);
+      if (code < start) return 0;
+      const deltaOff = startOff + segCount * 2;
+      const delta = buf.readInt16BE(deltaOff + seg * 2);
+      const rangeOff = deltaOff + segCount * 2;
+      const rangeAddr = rangeOff + seg * 2;
+      const ro = buf.readUInt16BE(rangeAddr);
+      if (ro === 0) return (code + delta) & 0xFFFF;
+      const glyphAddr = rangeAddr + ro + (code - start) * 2;
+      const gid = buf.readUInt16BE(glyphAddr);
+      return gid === 0 ? 0 : (gid + delta) & 0xFFFF;
     }
     return 0;
   }
-
-  // One glyph's contours: arrays of points { x, y, on } in font units.
-  function glyphContours(glyphId, depth = 0) {
-    const start = glyphOffset(glyphId);
-    const end = glyphOffset(glyphId + 1);
-    if (start === end || depth > 4) return [];
-    const at = glyfAt + start;
-    const contourCount = i16(at);
-    if (contourCount < 0) {
-      // Composite glyph: place each component's own contours.
-      const contours = [];
-      let p = at + 10;
+  advance(gid) {
+    const hmtx = this.tables.hmtx.off;
+    const g = Math.min(gid, this.numHMetrics - 1);
+    return this.buf.readUInt16BE(hmtx + g * 4);
+  }
+  glyphOffset(gid) {
+    const loca = this.tables.loca.off;
+    const glyf = this.tables.glyf.off;
+    if (this.indexToLocFormat === 1) {
+      const a = this.buf.readUInt32BE(loca + gid * 4);
+      const b = this.buf.readUInt32BE(loca + (gid + 1) * 4);
+      return a === b ? -1 : glyf + a;
+    }
+    const a = this.buf.readUInt16BE(loca + gid * 2) * 2;
+    const b = this.buf.readUInt16BE(loca + (gid + 1) * 2) * 2;
+    return a === b ? -1 : glyf + a;
+  }
+  // Flattened outline: array of contours, each an array of [x, y]
+  // points (font units, y up) with curves already subdivided.
+  outline(gid, depth) {
+    const off = this.glyphOffset(gid);
+    if (off < 0 || depth > 4) return [];
+    const buf = this.buf;
+    const numContours = buf.readInt16BE(off);
+    if (numContours < 0) {
+      // Composite glyph: gather transformed component outlines.
+      let p = off + 10;
+      let contours = [];
       for (;;) {
-        const flags = u16(p);
-        const componentId = u16(p + 2);
+        const flags = buf.readUInt16BE(p);
+        const compGid = buf.readUInt16BE(p + 2);
         p += 4;
-        let arg1;
-        let arg2;
+        let dx, dy;
         if (flags & 0x0001) {
-          arg1 = i16(p);
-          arg2 = i16(p + 2);
-          p += 4;
+          dx = buf.readInt16BE(p); dy = buf.readInt16BE(p + 2); p += 4;
         } else {
-          arg1 = bytes[p] >= 128 ? bytes[p] - 256 : bytes[p];
-          arg2 = bytes[p + 1] >= 128 ? bytes[p + 1] - 256 : bytes[p + 1];
-          p += 2;
+          dx = buf.readInt8(p); dy = buf.readInt8(p + 1); p += 2;
         }
-        let scaleX = 1;
-        let scaleY = 1;
-        if (flags & 0x0008) {
-          scaleX = i16(p) / 16384;
-          scaleY = scaleX;
-          p += 2;
-        } else if (flags & 0x0040) {
-          scaleX = i16(p) / 16384;
-          scaleY = i16(p + 2) / 16384;
-          p += 4;
-        } else if (flags & 0x0080) {
-          p += 8; // A full 2x2 matrix: Anton's composites do not use one.
-        }
-        const dx = flags & 0x0002 ? arg1 : 0;
-        const dy = flags & 0x0002 ? arg2 : 0;
-        for (const contour of glyphContours(componentId, depth + 1)) {
-          contours.push(contour.map((point) => ({
-            x: point.x * scaleX + dx,
-            y: point.y * scaleY + dy,
-            on: point.on,
-          })));
+        let scale = 1;
+        if (flags & 0x0008) { scale = buf.readInt16BE(p) / 16384; p += 2; }
+        else if (flags & 0x0040) { p += 4; }
+        else if (flags & 0x0080) { p += 8; }
+        const sub = this.outline(compGid, depth + 1);
+        for (const contour of sub) {
+          contours.push(contour.map(([x, y]) => [x * scale + dx, y * scale + dy]));
         }
         if (!(flags & 0x0020)) break;
       }
       return contours;
     }
-
-    const endPoints = [];
-    for (let c = 0; c < contourCount; c += 1) endPoints.push(u16(at + 10 + c * 2));
-    let p = at + 10 + contourCount * 2;
-    const instructionLength = u16(p);
-    p += 2 + instructionLength;
-    const pointCount = contourCount === 0 ? 0 : endPoints[contourCount - 1] + 1;
-    const flags = [];
-    while (flags.length < pointCount) {
-      const flag = bytes[p];
-      p += 1;
-      flags.push(flag);
-      if (flag & 0x08) {
-        const repeat = bytes[p];
-        p += 1;
-        for (let r = 0; r < repeat; r += 1) flags.push(flag);
+    const endPts = [];
+    for (let i = 0; i < numContours; i++) endPts.push(buf.readUInt16BE(off + 10 + i * 2));
+    const total = numContours ? endPts[numContours - 1] + 1 : 0;
+    let p = off + 10 + numContours * 2 + 2 + buf.readUInt16BE(off + 10 + numContours * 2);
+    const flagsArr = [];
+    while (flagsArr.length < total) {
+      const f = buf[p++];
+      flagsArr.push(f);
+      if (f & 0x08) {
+        const rep = buf[p++];
+        for (let i = 0; i < rep; i++) flagsArr.push(f);
       }
     }
-    const xs = [];
-    let x = 0;
-    for (let i = 0; i < pointCount; i += 1) {
-      const flag = flags[i];
-      if (flag & 0x02) {
-        const step = bytes[p];
-        p += 1;
-        x += flag & 0x10 ? step : -step;
-      } else if (!(flag & 0x10)) {
-        x += i16(p);
-        p += 2;
-      }
+    const xs = [], ys = [];
+    let x = 0, y = 0;
+    // Short deltas are unsigned bytes whose sign lives in the
+    // "same-or-positive" flag bit; long deltas are signed words, and
+    // a set same-or-positive bit with no short bit means delta zero.
+    for (let i = 0; i < total; i++) {
+      const f = flagsArr[i];
+      if (f & 0x02) { const b = buf[p++]; x += (f & 0x10) ? b : -b; }
+      else if (!(f & 0x10)) { x += buf.readInt16BE(p); p += 2; }
       xs.push(x);
     }
-    const ys = [];
-    let y = 0;
-    for (let i = 0; i < pointCount; i += 1) {
-      const flag = flags[i];
-      if (flag & 0x04) {
-        const step = bytes[p];
-        p += 1;
-        y += flag & 0x20 ? step : -step;
-      } else if (!(flag & 0x20)) {
-        y += i16(p);
-        p += 2;
-      }
+    for (let i = 0; i < total; i++) {
+      const f = flagsArr[i];
+      if (f & 0x04) { const b = buf[p++]; y += (f & 0x20) ? b : -b; }
+      else if (!(f & 0x20)) { y += buf.readInt16BE(p); p += 2; }
       ys.push(y);
     }
     const contours = [];
-    let first = 0;
-    for (let c = 0; c < contourCount; c += 1) {
-      const contour = [];
-      for (let i = first; i <= endPoints[c]; i += 1) {
-        contour.push({ x: xs[i], y: ys[i], on: (flags[i] & 0x01) !== 0 });
+    let startIdx = 0;
+    for (let c = 0; c < numContours; c++) {
+      const pts = [];
+      for (let i = startIdx; i <= endPts[c]; i++) {
+        pts.push({ x: xs[i], y: ys[i], on: !!(flagsArr[i] & 0x01) });
       }
-      contours.push(contour);
-      first = endPoints[c] + 1;
+      startIdx = endPts[c] + 1;
+      contours.push(flattenContour(pts));
     }
     return contours;
   }
-
-  return { unitsPerEm, numGlyphs, glyphIndex, glyphContours, advanceOf };
 }
 
-// Flatten one glyph's contours into pixel-space polygons at the given
-// origin and scale. Font y grows up; pixel y grows down, hence the flip.
-function glyphPolygons(font, glyphId, originX, baselineY, scale) {
-  const polygons = [];
-  for (const contour of font.glyphContours(glyphId)) {
-    if (contour.length === 0) continue;
-    // Establish a starting on-curve point, synthesising one from the
-    // midpoint of two off-curve neighbours when the contour opens with
-    // an off-curve point.
-    const points = contour.slice();
-    let startPoint;
-    if (points[0].on) {
-      startPoint = points.shift();
-    } else if (points[points.length - 1].on) {
-      startPoint = points.pop();
+function flattenContour(pts) {
+  // Walk the on/off-curve point ring, emitting line points and
+  // subdividing quadratic segments into 8 chords.
+  const out = [];
+  const n = pts.length;
+  if (n === 0) return out;
+  let start;
+  if (pts[0].on) start = pts[0];
+  else if (pts[n - 1].on) start = pts[n - 1];
+  else start = { x: (pts[0].x + pts[n - 1].x) / 2, y: (pts[0].y + pts[n - 1].y) / 2 };
+  out.push([start.x, start.y]);
+  let prev = start;
+  const seq = [];
+  for (let i = 0; i < n; i++) seq.push(pts[i]);
+  if (pts[0].on) seq.push(pts[0]);
+  let i = pts[0].on ? 1 : 0;
+  let guard = 0;
+  while (i < seq.length && guard++ < 10000) {
+    const cur = seq[i];
+    if (cur.on) {
+      out.push([cur.x, cur.y]);
+      prev = cur;
+      i++;
     } else {
-      const last = points[points.length - 1];
-      startPoint = { x: (points[0].x + last.x) / 2, y: (points[0].y + last.y) / 2, on: true };
+      const next = seq[(i + 1) % seq.length] || cur;
+      let end;
+      if (next.on) { end = next; i += 2; }
+      else {
+        end = { x: (cur.x + next.x) / 2, y: (cur.y + next.y) / 2 };
+        i += 1;
+      }
+      for (let s = 1; s <= 8; s++) {
+        const t = s / 8, mt = 1 - t;
+        out.push([
+          mt * mt * prev.x + 2 * mt * t * cur.x + t * t * end.x,
+          mt * mt * prev.y + 2 * mt * t * cur.y + t * t * end.y
+        ]);
+      }
+      prev = end;
     }
-    const polygon = [[originX + startPoint.x * scale, baselineY - startPoint.y * scale]];
-    let previous = startPoint;
-    const queue = [...points, startPoint];
-    for (let i = 0; i < queue.length; i += 1) {
-      const point = queue[i];
-      if (point.on) {
-        polygon.push([originX + point.x * scale, baselineY - point.y * scale]);
-        previous = point;
-      } else {
-        const next = queue[i + 1];
-        if (!next) break;
-        const end = next.on
-          ? next
-          : { x: (point.x + next.x) / 2, y: (point.y + next.y) / 2, on: true };
-        // Flatten the quadratic curve previous -> point -> end.
-        const steps = 8;
-        for (let s = 1; s <= steps; s += 1) {
-          const t = s / steps;
-          const mt = 1 - t;
-          const fx = mt * mt * previous.x + 2 * mt * t * point.x + t * t * end.x;
-          const fy = mt * mt * previous.y + 2 * mt * t * point.y + t * t * end.y;
-          polygon.push([originX + fx * scale, baselineY - fy * scale]);
-        }
-        previous = end;
-        if (next.on) i += 1; // The on-curve end was consumed as a vertex.
+  }
+  return out;
+}
+
+// Measure a string in font units, with letter spacing in ems.
+function measureText(font, text, spacingEm) {
+  let width = 0;
+  const chars = [...text];
+  for (let i = 0; i < chars.length; i++) {
+    width += font.advance(font.glyphIndex(chars[i].codePointAt(0)));
+    if (i < chars.length - 1) width += spacingEm * font.unitsPerEm;
+  }
+  return width;
+}
+
+// Rasterise a string into an alpha mask {w, h, data:Uint8Array} whose
+// origin is the text's left edge at the baseline. Scanline fill with
+// the nonzero winding rule, supersampled 3x vertically.
+function textMask(font, text, px, spacingEm) {
+  const scale = px / font.unitsPerEm;
+  const widthFU = measureText(font, text, spacingEm);
+  const w = Math.max(1, Math.ceil(widthFU * scale));
+  const h = Math.ceil(px * 1.32);
+  const baseline = px * 1.02;
+  // Collect transformed edges: [x1, y1, x2, y2] in mask pixels, y down.
+  const edges = [];
+  let penX = 0;
+  for (const ch of text) {
+    const gid = font.glyphIndex(ch.codePointAt(0));
+    const contours = font.outline(gid, 0);
+    for (const contour of contours) {
+      for (let i = 0; i < contour.length; i++) {
+        const [ax, ay] = contour[i];
+        const [bx, by] = contour[(i + 1) % contour.length];
+        edges.push([
+          (penX + ax) * scale, baseline - ay * scale,
+          (penX + bx) * scale, baseline - by * scale
+        ]);
       }
     }
-    if (polygon.length > 2) polygons.push(polygon);
+    penX += font.advance(gid) + spacingEm * font.unitsPerEm;
   }
-  return polygons;
+  const SS = 3;
+  const data = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let covered = 0;
+    // accumulate per-x coverage over subrows
+    const cov = new Float32Array(w);
+    for (let s = 0; s < SS; s++) {
+      const yy = y + (s + 0.5) / SS;
+      const crossings = [];
+      for (const [x1, y1, x2, y2] of edges) {
+        if ((y1 <= yy && y2 > yy) || (y2 <= yy && y1 > yy)) {
+          const t = (yy - y1) / (y2 - y1);
+          crossings.push({ x: x1 + t * (x2 - x1), dir: y2 > y1 ? 1 : -1 });
+        }
+      }
+      crossings.sort((a, b) => a.x - b.x);
+      let winding = 0, prevX = 0;
+      for (const c of crossings) {
+        if (winding !== 0) {
+          const from = Math.max(0, Math.floor(prevX));
+          const to = Math.min(w - 1, Math.floor(c.x));
+          for (let x = from; x <= to; x++) cov[x] += 1;
+        }
+        winding += c.dir;
+        prevX = c.x;
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      if (cov[x] > 0) data[y * w + x] = Math.min(255, Math.round(cov[x] / SS * 255));
+      covered += cov[x];
+    }
+    void covered;
+  }
+  return { w, h, data, baseline };
 }
 
-// ---------------------------------------------------------------------------
-// A tiny RGB raster and the drawing the screenshots need.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Raster: a plain RGB pixel buffer with the drawing operations the
+// cover pipeline needs.
+// ---------------------------------------------------------------------
 
 class Raster {
-  constructor(width, height) {
-    this.width = width;
-    this.height = height;
-    this.data = new Uint8ClampedArray(width * height * 3);
+  constructor(w, h) {
+    this.width = w;
+    this.height = h;
+    this.data = new Uint8ClampedArray(w * h * 3);
   }
-
-  fillAll(r, g, b) {
-    for (let i = 0; i < this.data.length; i += 3) {
-      this.data[i] = r;
-      this.data[i + 1] = g;
-      this.data[i + 2] = b;
+  fill(r, g, b) {
+    for (let i = 0; i < this.width * this.height; i++) {
+      this.data[i * 3] = r; this.data[i * 3 + 1] = g; this.data[i * 3 + 2] = b;
     }
   }
-
-  setPixel(x, y, r, g, b) {
+  set(x, y, r, g, b) {
     if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
-    const at = (y * this.width + x) * 3;
-    this.data[at] = r;
-    this.data[at + 1] = g;
-    this.data[at + 2] = b;
+    const o = (y * this.width + x) * 3;
+    this.data[o] = r; this.data[o + 1] = g; this.data[o + 2] = b;
   }
-
-  blendPixel(x, y, r, g, b, alpha) {
-    if (x < 0 || y < 0 || x >= this.width || y >= this.height || alpha <= 0) return;
-    const at = (y * this.width + x) * 3;
-    const keep = 1 - Math.min(1, alpha);
-    this.data[at] = this.data[at] * keep + r * alpha;
-    this.data[at + 1] = this.data[at + 1] * keep + g * alpha;
-    this.data[at + 2] = this.data[at + 2] * keep + b * alpha;
+  blend(x, y, r, g, b, a) {
+    if (x < 0 || y < 0 || x >= this.width || y >= this.height || a <= 0) return;
+    const o = (y * this.width + x) * 3;
+    this.data[o] += (r - this.data[o]) * a;
+    this.data[o + 1] += (g - this.data[o + 1]) * a;
+    this.data[o + 2] += (b - this.data[o + 2]) * a;
   }
-
-  fillRect(x0, y0, rectWidth, rectHeight, r, g, b) {
-    const xEnd = Math.min(this.width, x0 + rectWidth);
-    const yEnd = Math.min(this.height, y0 + rectHeight);
-    for (let y = Math.max(0, y0); y < yEnd; y += 1) {
-      for (let x = Math.max(0, x0); x < xEnd; x += 1) this.setPixel(x, y, r, g, b);
-    }
+  get(x, y) {
+    const o = (y * this.width + x) * 3;
+    return [this.data[o], this.data[o + 1], this.data[o + 2]];
   }
-
-  // Fill a set of polygons with the nonzero winding rule. `paint` is
-  // called per pixel and returns [r, g, b].
-  fillPolygons(polygons, paint) {
-    let minY = Infinity;
-    let maxY = -Infinity;
-    for (const polygon of polygons) {
-      for (const [, py] of polygon) {
-        if (py < minY) minY = py;
-        if (py > maxY) maxY = py;
+  blit(src, dx, dy, dw, dh) {
+    // Bilinear-scale src into the rect at (dx, dy, dw, dh).
+    for (let y = 0; y < dh; y++) {
+      for (let x = 0; x < dw; x++) {
+        const fx = (x + 0.5) / dw * src.width - 0.5;
+        const fy = (y + 0.5) / dh * src.height - 0.5;
+        const [r, g, b] = sampleBilinear(src, fx, fy);
+        this.set(dx + x, dy + y, r, g, b);
       }
     }
-    if (!Number.isFinite(minY)) return;
-    const yStart = Math.max(0, Math.floor(minY));
-    const yEnd = Math.min(this.height - 1, Math.ceil(maxY));
-    const crossings = [];
-    for (let y = yStart; y <= yEnd; y += 1) {
-      const scanY = y + 0.5;
-      crossings.length = 0;
-      for (const polygon of polygons) {
-        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
-          const [xi, yi] = polygon[i];
-          const [xj, yj] = polygon[j];
-          if ((yi <= scanY && yj > scanY) || (yj <= scanY && yi > scanY)) {
-            const xAt = xi + ((scanY - yi) / (yj - yi)) * (xj - xi);
-            crossings.push({ x: xAt, direction: yj > yi ? 1 : -1 });
-          }
+  }
+}
+
+function sampleBilinear(img, fx, fy) {
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const tx = fx - x0, ty = fy - y0;
+  function px(x, y) {
+    const cx = Math.min(img.width - 1, Math.max(0, x));
+    const cy = Math.min(img.height - 1, Math.max(0, y));
+    const o = (cy * img.width + cx) * 3;
+    return [img.data[o], img.data[o + 1], img.data[o + 2]];
+  }
+  const a = px(x0, y0), b = px(x0 + 1, y0), c = px(x0, y0 + 1), d = px(x0 + 1, y0 + 1);
+  const out = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    out[i] = (a[i] * (1 - tx) + b[i] * tx) * (1 - ty) + (c[i] * (1 - tx) + d[i] * tx) * ty;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// Cover rendering - the same composition as app/src/cover.js, done
+// per pixel: panels, grade, decorations, borders, caption.
+// ---------------------------------------------------------------------
+
+function pointInConvex(px, py, poly) {
+  let sign = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [ax, ay] = poly[i];
+    const [bx, by] = poly[(i + 1) % poly.length];
+    const cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+    if (cross !== 0) {
+      const s = cross > 0 ? 1 : -1;
+      if (sign === 0) sign = s;
+      else if (s !== sign) return false;
+    }
+  }
+  return true;
+}
+
+function distToSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const ex = ax + t * dx - px, ey = ay + t * dy - py;
+  return Math.sqrt(ex * ex + ey * ey);
+}
+
+function strokeSegment(raster, ax, ay, bx, by, halfWidth, rgb, alpha) {
+  const minX = Math.max(0, Math.floor(Math.min(ax, bx) - halfWidth - 1));
+  const maxX = Math.min(raster.width - 1, Math.ceil(Math.max(ax, bx) + halfWidth + 1));
+  const minY = Math.max(0, Math.floor(Math.min(ay, by) - halfWidth - 1));
+  const maxY = Math.min(raster.height - 1, Math.ceil(Math.max(ay, by) + halfWidth + 1));
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const d = distToSegment(x + 0.5, y + 0.5, ax, ay, bx, by);
+      if (d <= halfWidth) raster.blend(x, y, rgb[0], rgb[1], rgb[2], alpha);
+      else if (d <= halfWidth + 1) raster.blend(x, y, rgb[0], rgb[1], rgb[2], alpha * (halfWidth + 1 - d));
+    }
+  }
+}
+
+function strokePolyline(raster, pts, halfWidth, rgb, alpha) {
+  for (let i = 0; i < pts.length - 1; i++) {
+    strokeSegment(raster, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], halfWidth, rgb, alpha);
+  }
+}
+
+function quadPoints(x1, y1, cx, cy, x2, y2, steps) {
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps, mt = 1 - t;
+    pts.push([
+      mt * mt * x1 + 2 * mt * t * cx + t * t * x2,
+      mt * mt * y1 + 2 * mt * t * cy + t * t * y2
+    ]);
+  }
+  return pts;
+}
+
+function drawSunHeadless(raster, W, H) {
+  const cx = W * 0.80, cy = H * 0.16, r = Math.min(W, H) * 0.13;
+  const R = r * 2.1;
+  const minX = Math.max(0, Math.floor(cx - R)), maxX = Math.min(W - 1, Math.ceil(cx + R));
+  const minY = Math.max(0, Math.floor(cy - R)), maxY = Math.min(H - 1, Math.ceil(cy + R));
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+      if (d <= r) {
+        const t = (y - (cy - r)) / (2 * r);
+        let rr = 255, gg = 215 - 106 * t, bb = 110 - 32 * t;
+        if (y > cy + r * 0.28 && y < cy + r * 0.37) { rr *= 0.65; gg *= 0.65; bb *= 0.65; }
+        if (y > cy + r * 0.55 && y < cy + r * 0.68) { rr *= 0.65; gg *= 0.65; bb *= 0.65; }
+        raster.set(x, y, rr, gg, bb);
+      } else if (d <= R) {
+        const t = (d - r) / (R - r);
+        const a = 0.5 * Math.pow(1 - t, 2);
+        raster.blend(x, y, 255, 150, 110, a);
+      }
+    }
+  }
+}
+
+// Strokes with alpha below 1 bead at polyline joints if each segment
+// blends on top of the last, so soft strokes are first accumulated
+// into a coverage mask (max, never sum) and composited exactly once.
+function strokeSegmentMask(mask, W, H, ax, ay, bx, by, halfWidth) {
+  const minX = Math.max(0, Math.floor(Math.min(ax, bx) - halfWidth - 1));
+  const maxX = Math.min(W - 1, Math.ceil(Math.max(ax, bx) + halfWidth + 1));
+  const minY = Math.max(0, Math.floor(Math.min(ay, by) - halfWidth - 1));
+  const maxY = Math.min(H - 1, Math.ceil(Math.max(ay, by) + halfWidth + 1));
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const d = distToSegment(x + 0.5, y + 0.5, ax, ay, bx, by);
+      const cov = d <= halfWidth ? 1 : d <= halfWidth + 1 ? halfWidth + 1 - d : 0;
+      const idx = y * W + x;
+      if (cov > mask[idx]) mask[idx] = cov;
+    }
+  }
+}
+
+function strokePolylineMask(mask, W, H, pts, halfWidth) {
+  for (let i = 0; i < pts.length - 1; i++) {
+    strokeSegmentMask(mask, W, H, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], halfWidth);
+  }
+}
+
+function compositeMaskGray(raster, mask, rgb, alpha) {
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] > 0) {
+      const x = i % raster.width, y = Math.floor(i / raster.width);
+      raster.blend(x, y, rgb[0], rgb[1], rgb[2], mask[i] * alpha);
+    }
+  }
+}
+
+function drawPalmsHeadless(raster, W, H) {
+  const ink = [12, 10, 24];
+  const mask = new Float32Array(W * H);
+  function palm(ox, oy, scale, lean, flip) {
+    const bx = ox * W, by = oy * H;
+    const topX = bx + lean * W * flip, topY = by - 0.34 * H * scale;
+    const trunk = quadPoints(bx, by, bx + lean * W * flip * 0.3, by - 0.2 * H * scale, topX, topY, 10);
+    strokePolylineMask(mask, W, H, trunk, Math.max(1.5, W * 0.005 * scale));
+    const fronds = [-2.6, -2.0, -1.4, -0.7, 0, 0.7, 1.3];
+    for (const f of fronds) {
+      const a = f * flip;
+      const len = 0.17 * W * scale * (1 - Math.abs(f) * 0.10);
+      const ex = topX + Math.sin(a) * len;
+      const ey = topY + Math.abs(Math.cos(a)) * len * 0.42 + len * 0.16;
+      const mx = topX + Math.sin(a) * len * 0.5;
+      const my = topY - len * 0.22;
+      strokePolylineMask(mask, W, H, quadPoints(topX, topY, mx, my, ex, ey, 8), Math.max(1, W * 0.003 * scale));
+    }
+  }
+  palm(0.015, 1.0, 1.0, 0.05, 1);
+  palm(0.99, 0.62, 0.72, 0.04, -1);
+  compositeMaskGray(raster, mask, ink, 0.55);
+}
+
+// Fill an arbitrary (possibly concave) polygon by scanline spans.
+function fillPolygon(raster, poly, rgb, alpha) {
+  let minY = Infinity, maxY = -Infinity;
+  for (const [, y] of poly) { if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  minY = Math.max(0, Math.floor(minY));
+  maxY = Math.min(raster.height - 1, Math.ceil(maxY));
+  for (let y = minY; y <= maxY; y++) {
+    const yy = y + 0.5;
+    const xs = [];
+    for (let i = 0; i < poly.length; i++) {
+      const [x1, y1] = poly[i];
+      const [x2, y2] = poly[(i + 1) % poly.length];
+      if ((y1 <= yy && y2 > yy) || (y2 <= yy && y1 > yy)) {
+        xs.push(x1 + (yy - y1) / (y2 - y1) * (x2 - x1));
+      }
+    }
+    xs.sort((a, b) => a - b);
+    for (let s = 0; s + 1 < xs.length; s += 2) {
+      const from = Math.max(0, Math.floor(xs[s]));
+      const to = Math.min(raster.width - 1, Math.floor(xs[s + 1]));
+      for (let x = from; x <= to; x++) raster.blend(x, y, rgb[0], rgb[1], rgb[2], alpha);
+    }
+  }
+}
+
+function drawSparklesHeadless(raster, W, H) {
+  function sparkle(cx, cy, r, alpha) {
+    // Four-point star: quadratic lobes tip-to-tip through the centre,
+    // the same construction the browser draws with canvas curves.
+    const tips = [
+      [cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]
+    ];
+    const poly = [];
+    for (let i = 0; i < 4; i++) {
+      const [x1, y1] = tips[i];
+      const [x2, y2] = tips[(i + 1) % 4];
+      const pts = quadPoints(x1, y1, cx, cy, x2, y2, 6);
+      for (let j = 0; j < pts.length - 1; j++) poly.push(pts[j]);
+    }
+    fillPolygon(raster, poly, [255, 246, 220], alpha);
+  }
+  const s = Math.min(W, H);
+  sparkle(W * 0.16, H * 0.13, s * 0.030, 0.9);
+  sparkle(W * 0.60, H * 0.07, s * 0.020, 0.7);
+  sparkle(W * 0.90, H * 0.44, s * 0.024, 0.8);
+  sparkle(W * 0.08, H * 0.58, s * 0.016, 0.6);
+}
+
+function applyGrade(raster, grade, intensity) {
+  const g = Grades.resolve(grade, intensity);
+  const W = raster.width, H = raster.height;
+  const d = raster.data;
+  const cx = W / 2, cy = H / 2, maxDist = Math.max(W, H) * 0.78, minDist = Math.min(W, H) * 0.42;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = (y * W + x) * 3;
+      let r = d[o], gg = d[o + 1], b = d[o + 2];
+      const luma = 0.299 * r + 0.587 * gg + 0.114 * b;
+      r = luma + (r - luma) * g.saturation;
+      gg = luma + (gg - luma) * g.saturation;
+      b = luma + (b - luma) * g.saturation;
+      r = (r - 128) * g.contrast + 128;
+      gg = (gg - 128) * g.contrast + 128;
+      b = (b - 128) * g.contrast + 128;
+      r *= g.brightness * g.gainR;
+      gg *= g.brightness * g.gainG;
+      b *= g.brightness * g.gainB;
+      const shadow = 1 - Math.min(255, Math.max(0, luma)) / 255;
+      r += g.shadowLift[0] * shadow;
+      gg += g.shadowLift[1] * shadow;
+      b += g.shadowLift[2] * shadow;
+      if (g.tintAlpha > 0) {
+        r += (g.tint[0] - r) * g.tintAlpha;
+        gg += (g.tint[1] - gg) * g.tintAlpha;
+        b += (g.tint[2] - b) * g.tintAlpha;
+      }
+      if (g.vignette > 0) {
+        const dist = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+        if (dist > minDist) {
+          const t = Math.min(1, (dist - minDist) / (maxDist - minDist));
+          const f = 1 - g.vignette * t;
+          r *= f; gg *= f; b *= f;
         }
       }
-      if (crossings.length === 0) continue;
-      crossings.sort((a, b) => a.x - b.x);
-      let winding = 0;
-      for (let c = 0; c < crossings.length; c += 1) {
-        winding += crossings[c].direction;
-        if (winding === 0 || c + 1 >= crossings.length) continue;
-        const xFrom = Math.ceil(crossings[c].x - 0.5);
-        const xTo = Math.floor(crossings[c + 1].x - 0.5);
-        for (let x = Math.max(0, xFrom); x <= Math.min(this.width - 1, xTo); x += 1) {
-          const [r, g, b] = paint(x, y);
-          this.setPixel(x, y, r, g, b);
-        }
-      }
-    }
-  }
-
-  // A thick line segment, drawn by stamping filled circles along it.
-  strokeThick(x0, y0, x1, y1, halfWidth, r, g, b) {
-    const length = Math.hypot(x1 - x0, y1 - y0);
-    const steps = Math.max(1, Math.ceil(length / Math.max(1, halfWidth * 0.6)));
-    const radiusSquared = halfWidth * halfWidth;
-    const extent = Math.ceil(halfWidth);
-    for (let s = 0; s <= steps; s += 1) {
-      const cx = x0 + ((x1 - x0) * s) / steps;
-      const cy = y0 + ((y1 - y0) * s) / steps;
-      for (let y = Math.floor(cy - extent); y <= cy + extent; y += 1) {
-        for (let x = Math.floor(cx - extent); x <= cx + extent; x += 1) {
-          const dx = x + 0.5 - cx;
-          const dy = y + 0.5 - cy;
-          if (dx * dx + dy * dy <= radiusSquared) this.setPixel(x, y, r, g, b);
-        }
-      }
-    }
-  }
-
-  // Bilinear sample of another image's RGB data at fractional coords.
-  static sample(source, fx, fy, out) {
-    const x0 = Math.max(0, Math.min(source.width - 1, Math.floor(fx)));
-    const y0 = Math.max(0, Math.min(source.height - 1, Math.floor(fy)));
-    const x1 = Math.min(source.width - 1, x0 + 1);
-    const y1 = Math.min(source.height - 1, y0 + 1);
-    const tx = Math.min(1, Math.max(0, fx - Math.floor(fx)));
-    const ty = Math.min(1, Math.max(0, fy - Math.floor(fy)));
-    const w = source.width;
-    const d = source.data;
-    for (let c = 0; c < 3; c += 1) {
-      const top = d[(y0 * w + x0) * 3 + c] * (1 - tx) + d[(y0 * w + x1) * 3 + c] * tx;
-      const bottom = d[(y1 * w + x0) * 3 + c] * (1 - tx) + d[(y1 * w + x1) * 3 + c] * tx;
-      out[c] = top * (1 - ty) + bottom * ty;
-    }
-  }
-
-  // Draw a source image scaled into a destination rectangle (bilinear).
-  drawImageScaled(source, dx, dy, destWidth, destHeight) {
-    const sample = [0, 0, 0];
-    for (let y = 0; y < destHeight; y += 1) {
-      const fy = ((y + 0.5) / destHeight) * source.height - 0.5;
-      for (let x = 0; x < destWidth; x += 1) {
-        const fx = ((x + 0.5) / destWidth) * source.width - 0.5;
-        Raster.sample(source, fx, fy, sample);
-        this.setPixel(dx + x, dy + y, sample[0], sample[1], sample[2]);
-      }
+      d[o] = r; d[o + 1] = gg; d[o + 2] = b;
     }
   }
 }
 
-// The grade maths from app/src/grades.js, inlined per pixel for speed;
-// the constants and operation order match gradePixel exactly.
-function makeGradeFunction(grade, strength) {
-  const t = Math.min(1, Math.max(0, strength));
-  const [sr, sg, sb] = grade.shadows;
-  const [hr, hg, hb] = grade.highlights;
-  return (r, g, b, out) => {
-    if (t <= 0) {
-      out[0] = r;
-      out[1] = g;
-      out[2] = b;
-      return;
-    }
-    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    let nr = luma + (r - luma) * grade.saturation;
-    let ng = luma + (g - luma) * grade.saturation;
-    let nb = luma + (b - luma) * grade.saturation;
-    nr = (nr - 128) * grade.contrast + 128;
-    ng = (ng - 128) * grade.contrast + 128;
-    nb = (nb - 128) * grade.contrast + 128;
-    const tone = Math.min(1, Math.max(0, luma / 255));
-    const tintMix = 0.38 * (0.35 + 0.65 * Math.abs(tone - 0.5) * 2) * 0.75;
-    nr += ((nr + (sr + (hr - sr) * tone)) / 2 - nr) * tintMix;
-    ng += ((ng + (sg + (hg - sg) * tone)) / 2 - ng) * tintMix;
-    nb += ((nb + (sb + (hb - sb) * tone)) / 2 - nb) * tintMix;
-    nr += grade.warmth;
-    nb -= grade.warmth;
-    out[0] = Math.min(255, Math.max(0, r + (nr - r) * t));
-    out[1] = Math.min(255, Math.max(0, g + (ng - g) * t));
-    out[2] = Math.min(255, Math.max(0, b + (nb - b) * t));
-  };
-}
-
-// Cover-fit source rectangle, the same maths as app/src/photos.js.
-function coverRect(photo, destWidth, destHeight, zoom, panX, panY) {
-  const photoAspect = photo.width / photo.height;
-  const destAspect = destWidth / destHeight;
-  let cropWidth;
-  let cropHeight;
-  if (photoAspect > destAspect) {
-    cropHeight = photo.height;
-    cropWidth = cropHeight * destAspect;
-  } else {
-    cropWidth = photo.width;
-    cropHeight = cropWidth / destAspect;
+function drawCaptionHeadless(raster, font, W, H, titleLines, subtitle) {
+  // Legibility gradient over the bottom third.
+  const bandTop = H * 0.66;
+  for (let y = Math.floor(bandTop); y < H; y++) {
+    const t = (y - bandTop) / (H - bandTop);
+    const a = t < 0.45 ? 0.45 * (t / 0.45) : 0.45 + 0.33 * ((t - 0.45) / 0.55);
+    for (let x = 0; x < W; x++) raster.blend(x, y, 10, 6, 18, a * 0.55);
   }
-  cropWidth /= zoom;
-  cropHeight /= zoom;
-  return {
-    sx: ((photo.width - cropWidth) / 2) * (1 + panX),
-    sy: ((photo.height - cropHeight) / 2) * (1 + panY),
-    sw: cropWidth,
-    sh: cropHeight,
-  };
-}
-
-// Lettering with the parsed Anton face. `paint` colours the glyph fill
-// per pixel; an optional outline pass stamps the glyph shapes offset in
-// every direction in a dark ink first, the way the app's canvas
-// lettering strokes its text.
-function textWidth(font, text, size, tracking = 0) {
-  const scale = size / font.unitsPerEm;
-  let width = 0;
-  for (const char of text) {
-    width += font.advanceOf(font.glyphIndex(char.codePointAt(0))) * scale + tracking;
-  }
-  return text.length > 0 ? width - tracking : 0;
-}
-
-function drawAntonText(raster, font, text, originX, baselineY, size, paint, options = {}) {
-  const tracking = options.tracking ?? 0;
-  const scale = size / font.unitsPerEm;
-  let cursorX = originX;
-  const glyphSets = [];
-  for (const char of text) {
-    const glyphId = font.glyphIndex(char.codePointAt(0));
-    glyphSets.push(glyphPolygons(font, glyphId, cursorX, baselineY, scale));
-    cursorX += font.advanceOf(glyphId) * scale + tracking;
-  }
-  const outline = options.outline ?? 0;
-  if (outline > 0) {
-    const ink = options.outlinePaint ?? (() => [22, 10, 36]);
-    for (let dy = -outline; dy <= outline; dy += 1) {
-      for (let dx = -outline; dx <= outline; dx += 1) {
-        if (dx === 0 && dy === 0) continue;
-        for (const polygons of glyphSets) {
-          const shifted = polygons.map((polygon) => polygon.map(([x, y]) => [x + dx, y + dy]));
-          raster.fillPolygons(shifted, ink);
-        }
-      }
+  const lines = (titleLines || []).filter((s) => s && s.trim());
+  const useLines = lines.length ? lines : ["LEONIDA NIGHTS"];
+  const maxWidth = W * 0.88;
+  let base = H * (useLines.length > 1 ? 0.115 : 0.15);
+  // Fit: shrink until the widest line fits.
+  for (const line of useLines) {
+    while (base > 14 && measureText(font, line.toUpperCase(), 0.01) * (base / font.unitsPerEm) > maxWidth) {
+      base -= 4;
     }
   }
-  for (const polygons of glyphSets) raster.fillPolygons(polygons, paint);
-  return cursorX - originX;
+  const lineStep = (H * (useLines.length > 1 ? 0.115 : 0.15)) * 1.04;
+  const subtitlePx = Math.max(14, H * 0.030);
+  const baseline0 = H * 0.965 - subtitlePx * 1.6 - (useLines.length - 1) * lineStep;
+  useLines.forEach((line, i) => {
+    const text = line.toUpperCase();
+    const mask = textMask(font, text, base, 0.01);
+    const x0 = Math.round((W - mask.w) / 2);
+    const y0 = Math.round(baseline0 + i * lineStep - mask.baseline);
+    const off = Math.max(2, base * 0.045);
+    compositeMask(raster, mask, x0 + off, y0 + off, [16, 8, 24], 0.85);
+    compositeMask(raster, mask, x0, y0, [255, 247, 234], 1);
+  });
+  if (subtitle) {
+    const spaced = subtitle.toUpperCase().split("").join(" ");
+    const mask = textMask(font, spaced, subtitlePx, 0.02);
+    const x0 = Math.round((W - mask.w) / 2);
+    const y0 = Math.round(H * 0.965 - mask.baseline);
+    compositeMask(raster, mask, x0, y0, [255, 209, 102], 1);
+  }
 }
 
-function drawAntonTextCentred(raster, font, text, centreX, baselineY, size, paint, options = {}) {
-  const width = textWidth(font, text, size, options.tracking ?? 0);
-  return drawAntonText(raster, font, text, centreX - width / 2, baselineY, size, paint, options);
-}
-
-// The caption gradient from the app: warm paper at the top of the
-// letters melting through gold and orange into pink at the baseline.
-function captionGradientPaint(topY, size) {
-  const stops = [
-    [0, [255, 247, 214]],
-    [0.45, [255, 210, 62]],
-    [0.75, [255, 122, 62]],
-    [1, [255, 79, 154]],
-  ];
-  return (x, y) => {
-    const t = Math.min(1, Math.max(0, (y - topY) / size));
-    for (let s = 0; s + 1 < stops.length; s += 1) {
-      const [t0, c0] = stops[s];
-      const [t1, c1] = stops[s + 1];
-      if (t >= t0 && t <= t1) {
-        const local = (t - t0) / (t1 - t0);
-        return [
-          c0[0] + (c1[0] - c0[0]) * local,
-          c0[1] + (c1[1] - c0[1]) * local,
-          c0[2] + (c1[2] - c0[2]) * local,
-        ];
-      }
-    }
-    return stops[stops.length - 1][1];
-  };
-}
-
-// Raster versions of the app's canvas decorations, drawn with the same
-// placements (fractions of the cover size) as app/src/decorations.js.
-function drawSunRaster(raster, cx, cy, radius) {
-  const glowRadius = radius * 2.4;
-  for (let y = Math.floor(cy - glowRadius); y <= cy + glowRadius; y += 1) {
-    for (let x = Math.floor(cx - glowRadius); x <= cx + glowRadius; x += 1) {
-      const distance = Math.hypot(x - cx, y - cy);
-      if (distance < glowRadius) {
-        raster.blendPixel(x, y, 255, 150, 92, 0.5 * (1 - distance / glowRadius));
-      }
+function compositeMask(raster, mask, x0, y0, rgb, strength) {
+  for (let y = 0; y < mask.h; y++) {
+    for (let x = 0; x < mask.w; x++) {
+      const a = mask.data[y * mask.w + x] / 255 * strength;
+      if (a > 0) raster.blend(x0 + x, y0 + y, rgb[0], rgb[1], rgb[2], a);
     }
   }
-  for (let y = Math.floor(cy - radius); y <= cy + radius; y += 1) {
-    const half = Math.sqrt(Math.max(0, radius * radius - (y - cy) * (y - cy)));
-    const t = (y - (cy - radius)) / (2 * radius);
-    const r = 255;
-    const g = Math.round(233 + (92 - 233) * t);
-    const b = Math.round(168 + (138 - 168) * t);
-    for (let x = Math.floor(cx - half); x <= cx + half; x += 1) raster.setPixel(x, y, r, g, b);
-  }
-  raster.fillRect(Math.floor(cx - radius), Math.floor(cy + radius * 0.28), Math.ceil(radius * 2), Math.max(1, Math.round(radius * 0.07)), 40, 16, 60);
-  raster.fillRect(Math.floor(cx - radius), Math.floor(cy + radius * 0.52), Math.ceil(radius * 2), Math.max(1, Math.round(radius * 0.1)), 40, 16, 60);
 }
 
-function drawPalmRaster(raster, baseX, baseY, height, lean, flip) {
-  const ink = [12, 5, 22];
-  const crownX = baseX + flip * lean * height;
-  const crownY = baseY - height;
-  const curvePoint = (p0, p1, p2, t) => {
-    const mt = 1 - t;
-    return [mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0], mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]];
-  };
-  const strokeCurve = (p0, p1, p2, halfWidth) => {
-    let previous = p0;
-    for (let s = 1; s <= 14; s += 1) {
-      const point = curvePoint(p0, p1, p2, s / 14);
-      raster.strokeThick(previous[0], previous[1], point[0], point[1], halfWidth, ink[0], ink[1], ink[2]);
-      previous = point;
-    }
-  };
-  strokeCurve([baseX, baseY], [baseX + flip * lean * height * 0.3, baseY - height * 0.55], [crownX, crownY], height * 0.023);
-  for (let i = 0; i < 7; i += 1) {
-    const angle = Math.PI * (0.08 + (0.84 * i) / 6);
-    const length = height * (0.34 + 0.1 * Math.sin(i * 2.3));
-    const end = [crownX + flip * Math.cos(angle) * length, crownY - Math.sin(angle) * length * 0.35 + length * 0.3];
-    const mid = [crownX + flip * Math.cos(angle) * length * 0.5, crownY - Math.sin(angle) * length * 0.55];
-    strokeCurve([crownX, crownY], mid, end, height * 0.01);
-  }
-}
+function renderCover(shot, photos, font) {
+  const W = shot.width, H = shot.height;
+  const raster = new Raster(W, H);
+  raster.fill(20, 16, 31);
+  const layout = Layouts.byId(shot.layout);
+  const polys = layout.panels().map((poly) => poly.map(([fx, fy]) => [fx * W, fy * H]));
 
-function drawSparkleRaster(raster, cx, cy, radius, colour) {
-  const points = [];
-  for (let i = 0; i < 8; i += 1) {
-    const angle = (Math.PI / 4) * i - Math.PI / 2;
-    const reach = i % 2 === 0 ? radius : radius * 0.2;
-    points.push([cx + Math.cos(angle) * reach, cy + Math.sin(angle) * reach]);
-  }
-  raster.fillPolygons([points], () => colour);
-}
-
-// Render one cover at an exact pixel size: panels of graded photo,
-// bright borders, a frame, a vignette, decorations, and the caption.
-function renderCoverRaster(shot, photos, font, width, height) {
-  const raster = new Raster(width, height);
-  raster.fillAll(27, 15, 46);
-  const layout = getLayout(shot.layout);
-  const gradeFunction = makeGradeFunction(getGrade(shot.grade), shot.gradeStrength);
-  const sample = [0, 0, 0];
-  const graded = [0, 0, 0];
-
-  layout.panels.forEach((panel, index) => {
-    const bounds = panelBounds(panel);
-    const bx = bounds.minX * width;
-    const by = bounds.minY * height;
-    const bw = bounds.width * width;
-    const bh = bounds.height * height;
-    const photoName = shot.photos[index % shot.photos.length];
-    const photo = photos.get(photoName);
-    const rect = photo ? coverRect(photo, bw, bh, 1, 0, shot.panY ?? 0) : null;
-    const pixelPanel = panel.map(([nx, ny]) => [nx * width, ny * height]);
-    const yStart = Math.max(0, Math.floor(by));
-    const yEnd = Math.min(height - 1, Math.ceil(by + bh));
-    for (let y = yStart; y <= yEnd; y += 1) {
-      // The panel is a convex quad, so each scanline crosses it in one
-      // span between the outermost edge intersections.
-      const scanY = y + 0.5;
-      let minX = Infinity;
-      let maxX = -Infinity;
-      for (let i = 0, j = pixelPanel.length - 1; i < pixelPanel.length; j = i, i += 1) {
-        const [xi, yi] = pixelPanel[i];
-        const [xj, yj] = pixelPanel[j];
-        if ((yi <= scanY && yj > scanY) || (yj <= scanY && yi > scanY)) {
-          const xAt = xi + ((scanY - yi) / (yj - yi)) * (xj - xi);
-          if (xAt < minX) minX = xAt;
-          if (xAt > maxX) maxX = xAt;
-        }
-      }
-      if (!Number.isFinite(minX)) continue;
-      const xFrom = Math.max(0, Math.ceil(minX - 0.5));
-      const xTo = Math.min(width - 1, Math.floor(maxX - 0.5));
-      for (let x = xFrom; x <= xTo; x += 1) {
-        if (photo) {
-          const fx = rect.sx + ((x - bx + 0.5) / bw) * rect.sw - 0.5;
-          const fy = rect.sy + ((y - by + 0.5) / bh) * rect.sh - 0.5;
-          Raster.sample(photo, fx, fy, sample);
-        } else {
-          const hueShift = (x + y) / Math.max(1, bw + bh);
-          sample[0] = 60 + 60 * hueShift;
-          sample[1] = 30 + 30 * hueShift;
-          sample[2] = 90 + 40 * hueShift;
-        }
-        gradeFunction(sample[0], sample[1], sample[2], graded);
-        raster.setPixel(x, y, graded[0], graded[1], graded[2]);
+  polys.forEach((poly, i) => {
+    const b = Layouts.boundsOf(layout.panels()[i]);
+    const bx = b.x * W, by = b.y * H, bw = b.w * W, bh = b.h * H;
+    const photo = photos[shot.photos[i % shot.photos.length]];
+    const zoom = shot.zooms[i % shot.zooms.length];
+    const scale = Math.max(bw / photo.width, bh / photo.height) * zoom;
+    const dw = photo.width * scale, dh = photo.height * scale;
+    const ox = bx + (bw - dw) / 2, oy = by + (bh - dh) / 2;
+    const minX = Math.max(0, Math.floor(bx)), maxX = Math.min(W - 1, Math.ceil(bx + bw));
+    const minY = Math.max(0, Math.floor(by)), maxY = Math.min(H - 1, Math.ceil(by + bh));
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (!pointInConvex(x + 0.5, y + 0.5, poly)) continue;
+        const sx = (x + 0.5 - ox) / scale - 0.5;
+        const sy = (y + 0.5 - oy) / scale - 0.5;
+        const [r, g, bb] = sampleBilinear(photo, sx, sy);
+        raster.set(x, y, r, g, bb);
       }
     }
   });
 
-  // Bright panel borders and the double frame.
-  const borderHalf = Math.max(1.2, Math.min(width, height) * 0.004);
-  for (const panel of layout.panels) {
-    const pixelPanel = panel.map(([nx, ny]) => [nx * width, ny * height]);
-    for (let i = 0; i < pixelPanel.length; i += 1) {
-      const [x0, y0] = pixelPanel[i];
-      const [x1, y1] = pixelPanel[(i + 1) % pixelPanel.length];
-      raster.strokeThick(x0, y0, x1, y1, borderHalf, 255, 233, 244);
+  applyGrade(raster, Grades.byId(shot.grade), shot.intensity);
+
+  if (shot.decorations.sun) drawSunHeadless(raster, W, H);
+  if (shot.decorations.palms) drawPalmsHeadless(raster, W, H);
+  if (shot.decorations.sparkles) drawSparklesHeadless(raster, W, H);
+
+  // Bright panel dividers and the outer frame.
+  const lw = Math.max(3, W * 0.007) / 2;
+  for (const poly of polys) {
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i];
+      const [bx2, by2] = poly[(i + 1) % poly.length];
+      strokeSegment(raster, ax, ay, bx2, by2, lw, [255, 246, 233], 1);
     }
   }
-  const frame = Math.max(4, Math.round(Math.min(width, height) * 0.008));
-  raster.fillRect(0, 0, width, frame, 22, 10, 36);
-  raster.fillRect(0, height - frame, width, frame, 22, 10, 36);
-  raster.fillRect(0, 0, frame, height, 22, 10, 36);
-  raster.fillRect(width - frame, 0, frame, height, 22, 10, 36);
+  const flw = Math.max(5, W * 0.011) / 2;
+  strokeSegment(raster, 0, 0, W, 0, flw, [255, 246, 233], 1);
+  strokeSegment(raster, 0, H, W, H, flw, [255, 246, 233], 1);
+  strokeSegment(raster, 0, 0, 0, H, flw, [255, 246, 233], 1);
+  strokeSegment(raster, W, 0, W, H, flw, [255, 246, 233], 1);
 
-  // Vignette.
-  const vignetteRadius = Math.max(width, height) * 0.75;
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const distance = Math.hypot(x - width / 2, y - height / 2);
-      if (distance > vignetteRadius * 0.45) {
-        const alpha = 0.38 * Math.min(1, (distance - vignetteRadius * 0.45) / (vignetteRadius * 0.55));
-        raster.blendPixel(x, y, 8, 2, 18, alpha);
-      }
-    }
-  }
-
-  if (shot.decorations.sun) {
-    drawSunRaster(raster, width * 0.8, height * 0.16, Math.min(width, height) * 0.085);
-  }
-  if (shot.decorations.palms) {
-    drawPalmRaster(raster, width * 0.045, height * 0.34, height * 0.3, 0.25, 1);
-    drawPalmRaster(raster, width * 0.97, height * 0.62, height * 0.22, -0.2, -1);
-  }
-  if (shot.decorations.sparkles) {
-    const unit = Math.min(width, height);
-    drawSparkleRaster(raster, width * 0.14, height * 0.1, unit * 0.028, [255, 255, 255]);
-    drawSparkleRaster(raster, width * 0.9, height * 0.42, unit * 0.02, [255, 210, 240]);
-    drawSparkleRaster(raster, width * 0.62, height * 0.07, unit * 0.016, [190, 240, 255]);
-  }
-
-  // Caption: scrim, gradient title, letterspaced subtitle.
-  const blockHeight = Math.round(height * 0.24);
-  for (let y = height - blockHeight; y < height; y += 1) {
-    const t = (y - (height - blockHeight)) / blockHeight;
-    const alpha = t < 0.55 ? 0.42 * (t / 0.55) : 0.42 + 0.3 * ((t - 0.55) / 0.45);
-    for (let x = 0; x < width; x += 1) raster.blendPixel(x, y, 10, 4, 24, alpha * 0.55);
-  }
-  const title = (shot.title || 'LEONIDA NIGHTS').toUpperCase();
-  let titleSize = height * 0.115;
-  const titleWidth = textWidth(font, title, titleSize);
-  const maxTitleWidth = width * 0.88;
-  if (titleWidth > maxTitleWidth) titleSize *= maxTitleWidth / titleWidth;
-  const subtitleSize = height * 0.03;
-  const titleBaseline = height - height * 0.055 - subtitleSize * 1.5;
-  drawAntonTextCentred(
-    raster, font, title, width / 2, titleBaseline, titleSize,
-    captionGradientPaint(titleBaseline - titleSize * 0.72, titleSize * 0.72),
-    { outline: Math.max(2, Math.round(titleSize * 0.045)) },
-  );
-  if (shot.subtitle) {
-    drawAntonTextCentred(
-      raster, font, shot.subtitle.toUpperCase(), width / 2, height - height * 0.022, subtitleSize,
-      () => [255, 217, 236],
-      { outline: Math.max(1, Math.round(subtitleSize * 0.08)), tracking: subtitleSize * 0.18 },
-    );
-  }
+  drawCaptionHeadless(raster, font, W, H, shot.title, shot.subtitle);
   return raster;
 }
 
-// The editor screenshot: the staged cover at work on the left, and the
-// editor's controls drawn on the right with the same lettering — panel
-// chips, layout choices, grade swatches, caption fields, export
-// buttons — so the shot shows the app itself, not a mock of it.
-function renderEditorRaster(shot, photos, font) {
-  const width = 1280;
-  const height = 800;
-  const raster = new Raster(width, height);
-  raster.fillAll(18, 8, 31);
+// ---------------------------------------------------------------------
+// Editor screenshot - a faithful headless sketch of app/index.html
+// under app/style.css: same dark panels, same accent, same control
+// labels, with the live cover on the stage.
+// ---------------------------------------------------------------------
 
-  const inkDim = [185, 168, 217];
-  const gold = [255, 210, 62];
-  const panelFill = [36, 21, 68];
-  const panelEdge = [61, 37, 102];
-  const drawBox = (x, y, w, h, fill, edge) => {
-    raster.fillRect(x, y, w, h, fill[0], fill[1], fill[2]);
-    raster.strokeThick(x, y, x + w, y, 1, edge[0], edge[1], edge[2]);
-    raster.strokeThick(x, y + h, x + w, y + h, 1, edge[0], edge[1], edge[2]);
-    raster.strokeThick(x, y, x, y + h, 1, edge[0], edge[1], edge[2]);
-    raster.strokeThick(x + w, y, x + w, y + h, 1, edge[0], edge[1], edge[2]);
-  };
-  const label = (text, x, y, size, colour) => {
-    drawAntonText(raster, font, text, x, y, size, () => colour, {});
-  };
-
-  label('LEONIDA COVER MAKER', 36, 52, 40, [255, 233, 168]);
-  label('OFFLINE POSTER STUDIO - NO UPLOADS', 880, 52, 17, inkDim);
-
-  // The staged cover, rendered by the same pipeline at preview size.
-  const preview = renderCoverRaster(shot, photos, font, 456, 570);
-  raster.drawImageScaled(preview, 36, 96, 456, 570);
-  raster.strokeThick(36, 96, 492, 96, 1.5, 255, 233, 244);
-  raster.strokeThick(36, 666, 492, 666, 1.5, 255, 233, 244);
-  raster.strokeThick(36, 96, 36, 666, 1.5, 255, 233, 244);
-  raster.strokeThick(492, 96, 492, 666, 1.5, 255, 233, 244);
-  label('DRAG A PANEL TO REFRAME IT - DROP PHOTOS TO LOAD THEM', 36, 700, 15, inkDim);
-  label('SAMPLES LOADED - PIER ON PANEL 1, BOULEVARD ON PANEL 2', 36, 730, 15, [94, 234, 255]);
-
-  const x0 = 540;
-  const colWidth = 704;
-
-  label('1 - PHOTOS', x0, 108, 21, gold);
-  const thumbNames = ['boulevard', 'pier'];
-  thumbNames.forEach((name, i) => {
-    const tx = x0 + i * 220;
-    drawBox(tx, 124, 200, 120, panelFill, panelEdge);
-    const photo = photos.get(name);
-    if (photo) {
-      const thumbRaster = new Raster(196, 96);
-      thumbRaster.drawImageScaled(photo, 0, 0, 196, 96);
-      raster.drawImageScaled(thumbRaster, tx + 2, 126, 196, 96);
+function fillRect(raster, x, y, w, h, rgb) {
+  for (let yy = Math.max(0, y); yy < Math.min(raster.height, y + h); yy++) {
+    for (let xx = Math.max(0, x); xx < Math.min(raster.width, x + w); xx++) {
+      raster.set(xx, yy, rgb[0], rgb[1], rgb[2]);
     }
-    label(name.toUpperCase() + ' SAMPLE', tx + 8, 262, 14, inkDim);
+  }
+}
+
+function strokeRect(raster, x, y, w, h, rgb) {
+  strokeSegment(raster, x, y, x + w, y, 0.6, rgb, 1);
+  strokeSegment(raster, x, y + h, x + w, y + h, 0.6, rgb, 1);
+  strokeSegment(raster, x, y, x, y + h, 0.6, rgb, 1);
+  strokeSegment(raster, x + w, y, x + w, y + h, 0.6, rgb, 1);
+}
+
+function drawLabel(raster, font, text, x, baseline, px, rgb, spacing) {
+  const mask = textMask(font, text, px, spacing || 0.04);
+  compositeMask(raster, mask, x, Math.round(baseline - mask.baseline), rgb, 1);
+  return mask.w;
+}
+
+function renderEditor(shot, photos, font) {
+  const W = shot.width, H = shot.height;
+  const raster = new Raster(W, H);
+  raster.fill(13, 13, 20); // --bg
+  const PANEL = [23, 23, 36], EDGE = [42, 42, 61], INK = [245, 240, 230];
+  const MUTED = [154, 148, 173], ACCENT = [255, 46, 136], SOFT = [255, 209, 102];
+
+  // Top bar.
+  fillRect(raster, 0, 0, W, 62, PANEL);
+  fillRect(raster, 0, 62, W, 1, EDGE);
+  let tx = 26;
+  tx += drawLabel(raster, font, "LEONIDA ", tx, 44, 30, INK, 0.02);
+  drawLabel(raster, font, "COVER MAKER", tx, 44, 30, ACCENT, 0.02);
+  drawLabel(raster, font, "OFFLINE - NO UPLOADS", W - 300, 40, 15, MUTED, 0.06);
+
+  // Left control rail: stacked sections mirroring the page.
+  const railX = 24, railW = 308;
+  let y = 82;
+  function section(title, height, drawBody) {
+    fillRect(raster, railX, y, railW, height, PANEL);
+    strokeRect(raster, railX, y, railW, height, EDGE);
+    drawLabel(raster, font, title, railX + 14, y + 26, 15, SOFT, 0.08);
+    drawBody(y);
+    y += height + 14;
+  }
+  // Pills sized by actually measuring the label in Anton, wrapped
+  // onto a second row when the rail runs out of width.
+  function pillRows(items, top, activeId) {
+    let px = railX + 14, py = top;
+    for (const item of items) {
+      const label = item.name.toUpperCase();
+      const w = Math.ceil(measureText(font, label, 0.03) * (13 / font.unitsPerEm)) + 22;
+      if (px + w > railX + railW - 14) { px = railX + 14; py += 32; }
+      fillRect(raster, px, py, w, 26, item.id === activeId ? ACCENT : [16, 16, 26]);
+      drawLabel(raster, font, label, px + 11, py + 19, 13, INK, 0.03);
+      px += w + 6;
+    }
+    return py;
+  }
+  section("LAYOUT", 106, (top) => {
+    pillRows(Layouts.LAYOUTS, top + 38, shot.layout);
   });
-  label('ONE PHOTO FILLS EVERY PANEL: OFF', x0 + 460, 150, 15, inkDim);
-  label('PANEL ZOOM 1.00X', x0 + 460, 180, 15, inkDim);
-
-  const chipLabels = ['PANEL 1 - PIER', 'PANEL 2 - BOULEVARD', 'PANEL 3 - PIER', 'PANEL 4 - BOULEVARD', 'PANEL 5 - BOULEVARD', 'PANEL 6 - PIER'];
-  chipLabels.forEach((text, i) => {
-    const cx = x0 + (i % 3) * 238;
-    const cy = 286 + Math.floor(i / 3) * 40;
-    const picked = i === 0;
-    drawBox(cx, cy, 226, 30, picked ? [255, 92, 168] : panelFill, picked ? [255, 92, 168] : panelEdge);
-    label(text, cx + 10, cy + 21, 13, picked ? [255, 255, 255] : inkDim);
+  section("COLOUR GRADE", 124, (top) => {
+    pillRows(Grades.GRADES, top + 38, shot.grade);
+    // intensity slider under the pills
+    fillRect(raster, railX + 14, top + 104, railW - 28, 5, EDGE);
+    fillRect(raster, railX + 14, top + 104, (railW - 28) * shot.intensity, 5, ACCENT);
+  });
+  section("CAPTION", 96, (top) => {
+    drawLabel(raster, font, shot.title.join(" / "), railX + 14, top + 52, 17, INK, 0.04);
+    drawLabel(raster, font, shot.subtitle, railX + 14, top + 78, 13, MUTED, 0.05);
+  });
+  section("EXPORT", 84, (top) => {
+    fillRect(raster, railX + 14, top + 38, railW - 28, 32, ACCENT);
+    drawLabel(raster, font, "DOWNLOAD PNG - 1080 X 1350", railX + 30, top + 60, 14, [255, 255, 255], 0.04);
   });
 
-  label('2 - LAYOUT', x0, 392, 21, gold);
-  const layoutNames = ['DIAGONAL SIX', 'HERO AND THREE', 'QUAD FOUR', 'NEON STRIPS'];
-  layoutNames.forEach((text, i) => {
-    const lx = x0 + (i % 2) * 358;
-    const ly = 408 + Math.floor(i / 2) * 44;
-    const picked = i === 0;
-    drawBox(lx, ly, 346, 34, panelFill, picked ? gold : panelEdge);
-    label(text, lx + 12, ly + 23, 15, picked ? [255, 247, 214] : inkDim);
-  });
-
-  label('3 - COLOUR GRADE', x0, 518, 21, gold);
-  const gradeSwatches = [
-    ['VICE SUNSET', [255, 166, 88]],
-    ['NEON NIGHTS', [94, 234, 255]],
-    ['GOLDEN HOUR', [255, 204, 110]],
-    ['MONO NOIR', [244, 244, 240]],
-  ];
-  gradeSwatches.forEach(([text, colour], i) => {
-    const gx = x0 + i * 178;
-    drawBox(gx, 534, 166, 30, panelFill, i === 0 ? gold : panelEdge);
-    raster.fillRect(gx + 8, 542, 14, 14, colour[0], colour[1], colour[2]);
-    label(text, gx + 30, 554, 12.5, inkDim);
-  });
-  raster.fillRect(x0, 580, colWidth, 6, 61, 37, 102);
-  raster.fillRect(x0, 580, Math.round(colWidth * 0.85), 6, 255, 92, 168);
-  label('GRADE STRENGTH 85%', x0, 606, 13, inkDim);
-
-  label('4 - CAPTION', x0, 640, 21, gold);
-  drawBox(x0, 652, 340, 36, [18, 8, 31], panelEdge);
-  label(shot.title, x0 + 12, 677, 17, [245, 238, 252]);
-  drawBox(x0 + 356, 652, 348, 36, [18, 8, 31], panelEdge);
-  label(shot.subtitle, x0 + 368, 677, 15, [245, 238, 252]);
-
-  label('5 - EXPORT PNG', x0, 722, 21, gold);
-  const exportLabels = ['SQUARE 1080 X 1080', 'PORTRAIT 1080 X 1350', 'WIDE 1920 X 1080'];
-  exportLabels.forEach((text, i) => {
-    const ex = x0 + i * 238;
-    drawBox(ex, 736, 226, 38, [80, 30, 84], gold);
-    label(text, ex + 10, 761, 13.5, [255, 247, 214]);
-  });
-
+  // Stage: the live cover (the portrait shot at half size), centred
+  // in the space right of the rail.
+  const stageX = railX + railW + 24, stageW = W - stageX - 24;
+  const cover = renderCover({ ...shot, width: 540, height: 675 }, photos, font);
+  const dx = stageX + Math.round((stageW - 540) / 2);
+  raster.blit(cover, dx, 84, 540, 675);
+  drawLabel(raster, font, "DRAG ON THE COVER TO PAN A PANEL", stageX + 8, H - 22, 13, MUTED, 0.06);
   return raster;
 }
 
-// ---------------------------------------------------------------------------
-// The program itself.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------
 
-function outputDirectory() {
-  if (process.env.MAKEFUN_OUTPUT_DIR) return process.env.MAKEFUN_OUTPUT_DIR;
-  return existsSync('/output') ? '/output' : join(here, 'out');
+function main() {
+  const font = new Font(fs.readFileSync(path.join(ROOT, "app", "fonts", "Anton-Regular.ttf")));
+  const photos = {};
+  for (const name of ["boulevard", "pier"]) {
+    photos[name] = decodeJPEG(fs.readFileSync(path.join(ROOT, "app", "samples", name + ".jpg")));
+  }
+  const outDir = path.join(ROOT, "screenshots");
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const shot of SHOTS) {
+    const raster = shot.kind === "editor"
+      ? renderEditor(shot, photos, font)
+      : renderCover(shot, photos, font);
+    const encoded = encodeFitting(raster, 262144);
+    fs.writeFileSync(path.join(outDir, shot.file), encoded);
+    console.log(shot.file + ": " + raster.width + "x" + raster.height + ", " + encoded.length + " bytes");
+  }
 }
 
-async function main() {
-  const outDir = outputDirectory();
-  const font = loadAntonFont(readFileSync(join(here, 'app/fonts/Anton-Regular.ttf')));
-  const photos = new Map();
-  for (const name of ['boulevard', 'pier']) {
-    photos.set(name, decodeJpeg(readFileSync(join(here, 'app/samples', `${name}.jpg`))));
-  }
-
-  // Render every shot and encode it as a JPEG that fits the gate's
-  // 256 KiB screenshot cap, stepping the quality down until it fits.
-  const rendered = new Map();
-  for (const shot of SHOT_LIST) {
-    const raster = shot.kind === 'editor'
-      ? renderEditorRaster(shot, photos, font)
-      : renderCoverRaster(shot, photos, font, shot.viewWidth, shot.viewHeight);
-    let quality = 84;
-    let bytes = encodeJpeg(raster, quality);
-    while (bytes.length > 262144 && quality > 42) {
-      quality -= 7;
-      bytes = encodeJpeg(raster, quality);
-    }
-    rendered.set(shot.file, bytes);
-    console.log(`${shot.file}: rendered ${raster.width}x${raster.height}, ${bytes.length} bytes at quality ${quality}`);
-    try {
-      writeFileSync(join(here, 'screenshots', shot.file), bytes);
-    } catch {
-      // The grader's copy of the repository is read-only: there the
-      // committed screenshots already hold these exact bytes.
-    }
-  }
-
-  mkdirSync(outDir, { recursive: true });
-  cpSync(join(here, 'app'), join(outDir, 'app'), { recursive: true });
-  mkdirSync(join(outDir, 'screenshots'), { recursive: true });
-  for (const [file, bytes] of rendered) {
-    writeFileSync(join(outDir, 'screenshots', file), bytes);
-  }
-  writeFileSync(
-    join(outDir, 'dossier.json'),
-    buildDossier(outDir, {
-      text_max_bytes: 163840,
-      screenshots: { max: 4, max_bytes: 262144 },
-      app_max_files: 993,
-      app_max_bytes: 50331648,
-      app_path_max_bytes: 1000,
-    }),
-  );
-  console.log(`app, screenshots and dossier.json written to ${outDir}`);
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await main();
-}
+main();

@@ -1,108 +1,79 @@
-// Photo handling for Leonida Cover Maker.
+// photos.js - getting pictures into the editor.
 //
-// Photos live entirely on the person's machine: files they pick or drop
-// are read through object URLs and drawn from <img> elements, never
-// uploaded anywhere. This module keeps the library of loaded photos and
-// the cover-fit maths that decides which part of a photo shows inside a
-// panel of a given shape, zoom and pan.
+// Three sources, all local: the two bundled samples the app ships
+// with, files the user picks, and files dropped onto the stage. Files
+// are read with object URLs and never leave the machine; the app makes
+// no network requests at all.
 
-// The two bundled sample photos, keyed by the ids shots.js uses.
-export const SAMPLE_PHOTOS = [
-  { id: 'boulevard', label: 'Boulevard sample', url: 'samples/boulevard.jpg' },
-  { id: 'pier', label: 'Pier sample', url: 'samples/pier.jpg' },
-];
+(function (root, factory) {
+  var api = factory();
+  root.LCMPhotos = api;
+})(typeof self !== "undefined" ? self : globalThis, function () {
+  "use strict";
 
-let photoCounter = 0;
+  var SAMPLES = [
+    { name: "boulevard", label: "Boulevard sample", src: "samples/boulevard.jpg" },
+    { name: "pier", label: "Pier sample", src: "samples/pier.jpg" }
+  ];
 
-export class PhotoLibrary {
-  constructor() {
-    this.byId = new Map();
-  }
-
-  // Register an already-loaded image element under an id.
-  add(id, image, label) {
-    this.byId.set(id, { id, image, label });
-    return id;
-  }
-
-  // Load one bundled sample by id; resolves once the image can be drawn.
-  loadSample(sampleId) {
-    const sample = SAMPLE_PHOTOS.find((entry) => entry.id === sampleId);
-    if (!sample) return Promise.reject(new Error(`unknown sample ${sampleId}`));
-    if (this.byId.has(sampleId)) return Promise.resolve(sampleId);
-    return new Promise((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => {
-        this.add(sampleId, image, sample.label);
-        resolve(sampleId);
-      };
-      image.onerror = () => reject(new Error(`could not load ${sample.url}`));
-      image.src = sample.url;
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = reject;
+      img.src = src;
     });
   }
 
-  // Load every bundled sample; the editor's starting point.
-  loadAllSamples() {
-    return Promise.all(SAMPLE_PHOTOS.map((sample) => this.loadSample(sample.id)));
+  // Load the bundled samples; returns [{name, img}] in SAMPLES order.
+  function loadSamples() {
+    return Promise.all(SAMPLES.map(function (s) {
+      return loadImage(s.src).then(function (img) { return { name: s.name, img: img }; });
+    }));
   }
 
-  // Read user files into the library; resolves with the new photo ids in
-  // the order the files were given. Non-image files are skipped.
-  addFiles(fileList) {
-    const jobs = [];
-    for (const file of fileList) {
-      if (!file.type.startsWith('image/')) continue;
-      photoCounter += 1;
-      const id = `user-${photoCounter}`;
-      jobs.push(
-        new Promise((resolve) => {
-          const image = new Image();
-          const url = URL.createObjectURL(file);
-          image.onload = () => {
-            this.add(id, image, file.name);
-            resolve(id);
-          };
-          image.onerror = () => resolve(null);
-          image.src = url;
-        }),
-      );
-    }
-    return Promise.all(jobs).then((ids) => ids.filter((id) => id !== null));
+  // Turn a File into a photo entry. Object URLs keep big phone photos
+  // out of memory-hungry data URLs.
+  function photoFromFile(file) {
+    var url = URL.createObjectURL(file);
+    return loadImage(url).then(function (img) {
+      return { name: file.name.replace(/\.[^.]+$/, ""), img: img };
+    });
   }
 
-  get(photoId) {
-    return this.byId.get(photoId) ?? null;
+  function photosFromFileList(files) {
+    var out = [];
+    var chain = Promise.resolve();
+    Array.prototype.forEach.call(files, function (f) {
+      if (!/^image\//.test(f.type)) return;
+      chain = chain.then(function () {
+        return photoFromFile(f).then(function (p) { out.push(p); });
+      });
+    });
+    return chain.then(function () { return out; });
   }
 
-  list() {
-    return [...this.byId.values()];
+  // Wire drag-and-drop onto an element; onPhotos receives photo entries.
+  function watchDropzone(el, onPhotos) {
+    el.addEventListener("dragover", function (ev) {
+      ev.preventDefault();
+      el.classList.add("dragging");
+    });
+    el.addEventListener("dragleave", function () { el.classList.remove("dragging"); });
+    el.addEventListener("drop", function (ev) {
+      ev.preventDefault();
+      el.classList.remove("dragging");
+      if (ev.dataTransfer && ev.dataTransfer.files.length) {
+        photosFromFileList(ev.dataTransfer.files).then(onPhotos);
+      }
+    });
   }
-}
 
-// Which rectangle of a photo to draw so it covers a destination box:
-// start from the largest centred crop that fills the box, shrink it by
-// the panel's zoom, then slide it by the panel's pan (pan is -1..1 of the
-// slack on each axis). Returns source x, y, width, height in photo pixels.
-export function coverSourceRect(photo, destWidth, destHeight, zoom, panX, panY) {
-  const photoAspect = photo.naturalWidth / photo.naturalHeight;
-  const destAspect = destWidth / destHeight;
-  let cropWidth;
-  let cropHeight;
-  if (photoAspect > destAspect) {
-    cropHeight = photo.naturalHeight;
-    cropWidth = cropHeight * destAspect;
-  } else {
-    cropWidth = photo.naturalWidth;
-    cropHeight = cropWidth / destAspect;
-  }
-  cropWidth /= zoom;
-  cropHeight /= zoom;
-  const slackX = photo.naturalWidth - cropWidth;
-  const slackY = photo.naturalHeight - cropHeight;
   return {
-    sx: (slackX / 2) * (1 + panX),
-    sy: (slackY / 2) * (1 + panY),
-    sw: cropWidth,
-    sh: cropHeight,
+    SAMPLES: SAMPLES,
+    loadSamples: loadSamples,
+    photoFromFile: photoFromFile,
+    photosFromFileList: photosFromFileList,
+    watchDropzone: watchDropzone
   };
-}
+});

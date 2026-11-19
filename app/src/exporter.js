@@ -1,43 +1,58 @@
-// PNG export for Leonida Cover Maker.
+// exporter.js - full-resolution PNG downloads.
 //
-// A cover is exported by rendering the current state once more, at the
-// exact pixel size of the chosen post format, on an offscreen canvas and
-// saving that canvas as a PNG. The preview canvas is never scaled up, so
-// exports stay sharp whatever size the editor happens to be shown at.
+// The preview canvas is small; an export re-renders the same state
+// onto an offscreen canvas at exactly the requested size - 1080x1080,
+// 1080x1350 or 1920x1080 - and saves the PNG. Because cover.js is
+// size-agnostic, the export is the preview, just with more pixels.
 
-import { renderCoverToCanvas } from './cover.js';
+(function (root, factory) {
+  var api = factory();
+  root.LCMExporter = api;
+})(typeof self !== "undefined" ? self : globalThis, function () {
+  "use strict";
 
-// The three post sizes the bounty asks for, in the order the export
-// buttons show them.
-export const EXPORT_SIZES = [
-  { id: 'square', label: 'Square post', width: 1080, height: 1080 },
-  { id: 'portrait', label: 'Portrait post', width: 1080, height: 1350 },
-  { id: 'wide', label: 'Wide banner', width: 1920, height: 1080 },
-];
+  var SIZES = [
+    { id: "1080x1080", width: 1080, height: 1080, label: "Square 1080 x 1080" },
+    { id: "1080x1350", width: 1080, height: 1350, label: "Portrait 1080 x 1350" },
+    { id: "1920x1080", width: 1920, height: 1080, label: "Wide 1920 x 1080" }
+  ];
 
-export function exportSizeById(sizeId) {
-  return EXPORT_SIZES.find((size) => size.id === sizeId) ?? EXPORT_SIZES[0];
-}
+  function sizeById(id) {
+    for (var i = 0; i < SIZES.length; i++) if (SIZES[i].id === id) return SIZES[i];
+    return SIZES[1];
+  }
 
-// A file name for an export: the caption's first words, made file-safe,
-// plus the pixel size.
-export function exportFileName(state, size) {
-  const base = (state.title || 'leonida-cover')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'leonida-cover';
-  return `${base}-${size.width}x${size.height}.png`;
-}
+  // The Anton face must be ready or the export silently falls back to
+  // a system font; document.fonts.load resolves once it is usable.
+  function ensureFont() {
+    if (document.fonts && document.fonts.load) {
+      return document.fonts.load("80px Anton").catch(function () { return null; });
+    }
+    return Promise.resolve(null);
+  }
 
-// Render and download one PNG at the requested size. Returns the canvas
-// it rendered, so callers (and the shot mode) can inspect the result.
-export function exportCoverPNG(state, library, size) {
-  const canvas = renderCoverToCanvas(state, library, size.width, size.height);
-  const link = document.createElement('a');
-  link.download = exportFileName(state, size);
-  link.href = canvas.toDataURL('image/png');
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  return canvas;
-}
+  function exportPNG(state, sizeId) {
+    var size = sizeById(sizeId || state.exportSize);
+    return ensureFont().then(function () {
+      var canvas = document.createElement("canvas");
+      canvas.width = size.width;
+      canvas.height = size.height;
+      var ctx = canvas.getContext("2d");
+      LCMCover.renderCover(ctx, size.width, size.height, state);
+      return new Promise(function (resolve) {
+        canvas.toBlob(function (blob) {
+          var a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "leonida-cover-" + size.id + ".png";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+          resolve(size);
+        }, "image/png");
+      });
+    });
+  }
+
+  return { SIZES: SIZES, sizeById: sizeById, exportPNG: exportPNG };
+});

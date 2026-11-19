@@ -1,117 +1,91 @@
-// Colour grades for Leonida Cover Maker.
+// grades.js - the four colour grades.
 //
-// A grade is a small set of numbers, and `gradePixel` turns one pixel
-// with them: it rebalances the pixel toward a shadow tint and a highlight
-// tint chosen by its brightness, adjusts saturation and contrast, then
-// mixes the result with the untouched pixel by the strength the person
-// picked (0 leaves the photo alone, 1 is the full grade). The function is
-// pure arithmetic on three numbers, so the browser editor and the
-// headless program in main.ts grade their pixels identically; only the
-// loops around it differ.
+// Each grade is data, not code: channel gains, saturation / contrast /
+// brightness, a tint colour with a strength, and how hard the corners
+// fall off. The browser renderer turns that into a canvas filter plus
+// a tint overlay; the headless renderer in main.ts applies the same
+// numbers per pixel. Intensity (0..1) lerps every field back towards
+// the neutral grade, which is what the slider in the editor does.
 
-function clamp255(value) {
-  if (value < 0) return 0;
-  if (value > 255) return 255;
-  return value;
-}
+(function (root, factory) {
+  var api = factory();
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  root.LCMGrades = api;
+})(typeof self !== "undefined" ? self : globalThis, function () {
+  "use strict";
 
-function mixChannel(a, b, t) {
-  return a + (b - a) * t;
-}
+  var NEUTRAL = {
+    gainR: 1, gainG: 1, gainB: 1,
+    saturation: 1, contrast: 1, brightness: 1,
+    tint: [255, 255, 255], tintAlpha: 0,
+    shadowLift: [0, 0, 0], vignette: 0.18
+  };
 
-export const GRADES = [
-  {
-    id: 'vice-sunset',
-    name: 'Vice Sunset',
-    shadows: [64, 26, 84],
-    highlights: [255, 166, 88],
-    saturation: 1.28,
-    contrast: 1.1,
-    warmth: 14,
-  },
-  {
-    id: 'neon-nights',
-    name: 'Neon Nights',
-    shadows: [18, 10, 64],
-    highlights: [94, 234, 255],
-    saturation: 1.45,
-    contrast: 1.16,
-    warmth: -8,
-  },
-  {
-    id: 'golden-hour',
-    name: 'Golden Hour',
-    shadows: [52, 30, 12],
-    highlights: [255, 204, 110],
-    saturation: 1.15,
-    contrast: 1.05,
-    warmth: 30,
-  },
-  {
-    id: 'mono-noir',
-    name: 'Mono Noir',
-    shadows: [8, 8, 10],
-    highlights: [244, 244, 240],
-    saturation: 0,
-    contrast: 1.3,
-    warmth: 0,
-  },
-];
-
-// Look a grade up by id, falling back to the first one.
-export function getGrade(gradeId) {
-  return GRADES.find((grade) => grade.id === gradeId) ?? GRADES[0];
-}
-
-// Grade one pixel. r, g, b are 0..255; returns [r, g, b] as floats.
-export function gradePixel(r, g, b, grade, strength) {
-  const t = Math.min(1, Math.max(0, strength));
-  if (t <= 0) return [r, g, b];
-
-  // Saturation around the pixel's own luminance.
-  const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  let nr = luma + (r - luma) * grade.saturation;
-  let ng = luma + (g - luma) * grade.saturation;
-  let nb = luma + (b - luma) * grade.saturation;
-
-  // Contrast around middle grey.
-  nr = (nr - 128) * grade.contrast + 128;
-  ng = (ng - 128) * grade.contrast + 128;
-  nb = (nb - 128) * grade.contrast + 128;
-
-  // Two-tone tint: dark pixels lean to the shadow colour, bright ones to
-  // the highlight colour, with the tint itself scaled by how far the
-  // pixel sits from middle brightness.
-  const tone = Math.min(1, Math.max(0, luma / 255));
-  const tintR = mixChannel(grade.shadows[0], grade.highlights[0], tone);
-  const tintG = mixChannel(grade.shadows[1], grade.highlights[1], tone);
-  const tintB = mixChannel(grade.shadows[2], grade.highlights[2], tone);
-  const tintAmount = 0.38 * (0.35 + 0.65 * Math.abs(tone - 0.5) * 2);
-  const tintMix = tintAmount * 0.75;
-  nr = mixChannel(nr, (nr + tintR) / 2, tintMix);
-  ng = mixChannel(ng, (ng + tintG) / 2, tintMix);
-  nb = mixChannel(nb, (nb + tintB) / 2, tintMix);
-
-  // Warmth shifts red up and blue down (or the reverse when negative).
-  nr += grade.warmth;
-  nb -= grade.warmth;
-
-  return [
-    clamp255(mixChannel(r, nr, t)),
-    clamp255(mixChannel(g, ng, t)),
-    clamp255(mixChannel(b, nb, t)),
+  var GRADES = [
+    {
+      id: "vice", name: "Vice Sunset",
+      gainR: 1.06, gainG: 0.99, gainB: 0.94,
+      saturation: 1.28, contrast: 1.08, brightness: 1.01,
+      tint: [255, 94, 138], tintAlpha: 0.12,
+      shadowLift: [0, 22, 26], vignette: 0.22
+    },
+    {
+      id: "neon", name: "Neon Nights",
+      gainR: 1.03, gainG: 0.94, gainB: 1.17,
+      saturation: 1.46, contrast: 1.15, brightness: 1.0,
+      tint: [255, 46, 166], tintAlpha: 0.10,
+      shadowLift: [10, 6, 30], vignette: 0.30
+    },
+    {
+      id: "golden", name: "Golden Hour",
+      gainR: 1.11, gainG: 1.0, gainB: 0.83,
+      saturation: 1.16, contrast: 1.04, brightness: 1.03,
+      tint: [255, 179, 71], tintAlpha: 0.14,
+      shadowLift: [24, 12, 0], vignette: 0.20
+    },
+    {
+      id: "noir", name: "Mono Noir",
+      gainR: 1.0, gainG: 1.0, gainB: 1.0,
+      saturation: 0.0, contrast: 1.24, brightness: 1.02,
+      tint: [200, 210, 225], tintAlpha: 0.05,
+      shadowLift: [4, 4, 6], vignette: 0.38
+    }
   ];
-}
 
-// Grade a whole browser ImageData in place; the editor's wrapper around
-// gradePixel.
-export function gradeImageData(imageData, grade, strength) {
-  const data = imageData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const [r, g, b] = gradePixel(data[i], data[i + 1], data[i + 2], grade, strength);
-    data[i] = r;
-    data[i + 1] = g;
-    data[i + 2] = b;
+  function byId(id) {
+    for (var i = 0; i < GRADES.length; i++) if (GRADES[i].id === id) return GRADES[i];
+    return GRADES[0];
   }
-  return imageData;
-}
+
+  // Blend a grade towards neutral by (1 - intensity).
+  function resolve(grade, intensity) {
+    var t = Math.max(0, Math.min(1, intensity == null ? 1 : intensity));
+    function mix(a, b) { return a + (b - a) * t; }
+    return {
+      gainR: mix(1, grade.gainR), gainG: mix(1, grade.gainG), gainB: mix(1, grade.gainB),
+      saturation: mix(1, grade.saturation),
+      contrast: mix(1, grade.contrast),
+      brightness: mix(1, grade.brightness),
+      tint: grade.tint,
+      tintAlpha: grade.tintAlpha * t,
+      shadowLift: [
+        grade.shadowLift[0] * t, grade.shadowLift[1] * t, grade.shadowLift[2] * t
+      ],
+      vignette: mix(NEUTRAL.vignette, grade.vignette)
+    };
+  }
+
+  // The browser-side approximation of the same numbers: a CSS filter
+  // string for the photo layer. The tint and vignette are drawn as
+  // overlays by cover.js.
+  function filterString(grade, intensity) {
+    var g = resolve(grade, intensity);
+    return (
+      "saturate(" + g.saturation.toFixed(3) + ") " +
+      "contrast(" + g.contrast.toFixed(3) + ") " +
+      "brightness(" + g.brightness.toFixed(3) + ")"
+    );
+  }
+
+  return { GRADES: GRADES, NEUTRAL: NEUTRAL, byId: byId, resolve: resolve, filterString: filterString };
+});
