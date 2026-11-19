@@ -1,87 +1,117 @@
-// Colour grades: each grade is a photo adjustment (saturation / contrast / brightness, applied as a canvas
-// filter while the panels are drawn) plus a stack of gradient overlays painted over the whole cover. The
-// editor's intensity slider blends between the raw photo (0) and the full grade (1). Overlay stops are
-// [offset, red, green, blue, alpha] so the painter can scale their alpha by the intensity.
+// Colour grades for Leonida Cover Maker.
+//
+// A grade is a small set of numbers, and `gradePixel` turns one pixel
+// with them: it rebalances the pixel toward a shadow tint and a highlight
+// tint chosen by its brightness, adjusts saturation and contrast, then
+// mixes the result with the untouched pixel by the strength the person
+// picked (0 leaves the photo alone, 1 is the full grade). The function is
+// pure arithmetic on three numbers, so the browser editor and the
+// headless program in main.ts grade their pixels identically; only the
+// loops around it differ.
+
+function clamp255(value) {
+  if (value < 0) return 0;
+  if (value > 255) return 255;
+  return value;
+}
+
+function mixChannel(a, b, t) {
+  return a + (b - a) * t;
+}
 
 export const GRADES = [
   {
-    id: 'vice',
+    id: 'vice-sunset',
     name: 'Vice Sunset',
-    blurb: 'Warm pink and orange, teal shade',
-    saturation: 1.3, contrast: 1.07, brightness: 1.04,
-    overlays: [
-      { kind: 'down', blend: 'source-over', stops: [[0, 32, 200, 190, 0.13], [0.42, 255, 120, 80, 0.05], [0.75, 255, 64, 110, 0.3], [1, 214, 32, 118, 0.48]] },
-      { kind: 'up', blend: 'soft-light', stops: [[0, 255, 150, 60, 0.55], [0.6, 255, 150, 60, 0]] },
-    ],
+    shadows: [64, 26, 84],
+    highlights: [255, 166, 88],
+    saturation: 1.28,
+    contrast: 1.1,
+    warmth: 14,
   },
   {
-    id: 'neon',
+    id: 'neon-nights',
     name: 'Neon Nights',
-    blurb: 'Teal and magenta nightclub wash',
-    saturation: 1.38, contrast: 1.13, brightness: 0.99,
-    overlays: [
-      { kind: 'down', blend: 'source-over', stops: [[0, 255, 0, 128, 0.2], [0.45, 90, 0, 160, 0.04], [1, 0, 210, 255, 0.3]] },
-      { kind: 'up', blend: 'soft-light', stops: [[0, 0, 229, 255, 0.5], [0.55, 0, 229, 255, 0]] },
-      { kind: 'down', blend: 'soft-light', stops: [[0, 255, 60, 180, 0.45], [0.5, 255, 60, 180, 0]] },
-    ],
+    shadows: [18, 10, 64],
+    highlights: [94, 234, 255],
+    saturation: 1.45,
+    contrast: 1.16,
+    warmth: -8,
   },
   {
-    id: 'golden',
+    id: 'golden-hour',
     name: 'Golden Hour',
-    blurb: 'Amber light, long shadows',
-    saturation: 1.18, contrast: 1.05, brightness: 1.07,
-    overlays: [
-      { kind: 'down', blend: 'source-over', stops: [[0, 255, 196, 96, 0.1], [0.6, 255, 150, 60, 0.12], [1, 226, 92, 30, 0.34]] },
-      { kind: 'up', blend: 'soft-light', stops: [[0, 255, 176, 66, 0.6], [0.65, 255, 176, 66, 0]] },
-    ],
+    shadows: [52, 30, 12],
+    highlights: [255, 204, 110],
+    saturation: 1.15,
+    contrast: 1.05,
+    warmth: 30,
   },
   {
-    id: 'noir',
+    id: 'mono-noir',
     name: 'Mono Noir',
-    blurb: 'Black and white, hard contrast',
-    saturation: 0.04, contrast: 1.28, brightness: 1.02,
-    overlays: [
-      { kind: 'down', blend: 'source-over', stops: [[0, 0, 0, 0, 0.3], [0.35, 0, 0, 0, 0], [0.7, 0, 0, 0, 0.08], [1, 0, 0, 0, 0.5]] },
-      { kind: 'down', blend: 'soft-light', stops: [[0, 255, 255, 255, 0.35], [0.4, 255, 255, 255, 0]] },
-    ],
+    shadows: [8, 8, 10],
+    highlights: [244, 244, 240],
+    saturation: 0,
+    contrast: 1.3,
+    warmth: 0,
   },
 ];
 
-/** The grade with this id, or the first grade when the id is unknown. */
-export function gradeById(id) {
-  return GRADES.find((grade) => grade.id === id) ?? GRADES[0];
+// Look a grade up by id, falling back to the first one.
+export function getGrade(gradeId) {
+  return GRADES.find((grade) => grade.id === gradeId) ?? GRADES[0];
 }
 
-/** The canvas filter string for a grade at an intensity: each adjustment lerps from neutral (1) to the grade. */
-export function gradeFilter(grade, intensity) {
-  const lerp = (target) => 1 + (target - 1) * intensity;
-  return `saturate(${lerp(grade.saturation).toFixed(3)}) contrast(${lerp(grade.contrast).toFixed(3)}) brightness(${lerp(grade.brightness).toFixed(3)})`;
+// Grade one pixel. r, g, b are 0..255; returns [r, g, b] as floats.
+export function gradePixel(r, g, b, grade, strength) {
+  const t = Math.min(1, Math.max(0, strength));
+  if (t <= 0) return [r, g, b];
+
+  // Saturation around the pixel's own luminance.
+  const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  let nr = luma + (r - luma) * grade.saturation;
+  let ng = luma + (g - luma) * grade.saturation;
+  let nb = luma + (b - luma) * grade.saturation;
+
+  // Contrast around middle grey.
+  nr = (nr - 128) * grade.contrast + 128;
+  ng = (ng - 128) * grade.contrast + 128;
+  nb = (nb - 128) * grade.contrast + 128;
+
+  // Two-tone tint: dark pixels lean to the shadow colour, bright ones to
+  // the highlight colour, with the tint itself scaled by how far the
+  // pixel sits from middle brightness.
+  const tone = Math.min(1, Math.max(0, luma / 255));
+  const tintR = mixChannel(grade.shadows[0], grade.highlights[0], tone);
+  const tintG = mixChannel(grade.shadows[1], grade.highlights[1], tone);
+  const tintB = mixChannel(grade.shadows[2], grade.highlights[2], tone);
+  const tintAmount = 0.38 * (0.35 + 0.65 * Math.abs(tone - 0.5) * 2);
+  const tintMix = tintAmount * 0.75;
+  nr = mixChannel(nr, (nr + tintR) / 2, tintMix);
+  ng = mixChannel(ng, (ng + tintG) / 2, tintMix);
+  nb = mixChannel(nb, (nb + tintB) / 2, tintMix);
+
+  // Warmth shifts red up and blue down (or the reverse when negative).
+  nr += grade.warmth;
+  nb -= grade.warmth;
+
+  return [
+    clamp255(mixChannel(r, nr, t)),
+    clamp255(mixChannel(g, ng, t)),
+    clamp255(mixChannel(b, nb, t)),
+  ];
 }
 
-/** One overlay's canvas gradient across a w x h cover. */
-function overlayGradient(ctx, w, h, overlay) {
-  const gradient = overlay.kind === 'up'
-    ? ctx.createLinearGradient(0, h, 0, 0)
-    : ctx.createLinearGradient(0, 0, 0, h);
-  return gradient;
-}
-
-/** Paints a grade's overlays, then a vignette, over a cover already drawn on ctx at w x h. */
-export function paintGradeOverlay(ctx, w, h, grade, intensity) {
-  for (const overlay of grade.overlays) {
-    const gradient = overlayGradient(ctx, w, h, overlay);
-    for (const [offset, r, g, b, a] of overlay.stops) {
-      gradient.addColorStop(offset, `rgba(${r}, ${g}, ${b}, ${(a * intensity).toFixed(3)})`);
-    }
-    ctx.save();
-    ctx.globalCompositeOperation = overlay.blend;
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, w, h);
-    ctx.restore();
+// Grade a whole browser ImageData in place; the editor's wrapper around
+// gradePixel.
+export function gradeImageData(imageData, grade, strength) {
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const [r, g, b] = gradePixel(data[i], data[i + 1], data[i + 2], grade, strength);
+    data[i] = r;
+    data[i + 1] = g;
+    data[i + 2] = b;
   }
-  const vignette = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.78);
-  vignette.addColorStop(0, 'rgba(12, 4, 24, 0)');
-  vignette.addColorStop(1, `rgba(12, 4, 24, ${(0.36 * intensity + 0.08).toFixed(3)})`);
-  ctx.fillStyle = vignette;
-  ctx.fillRect(0, 0, w, h);
+  return imageData;
 }

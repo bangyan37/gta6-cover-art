@@ -3,84 +3,92 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Leonida Cover Maker — GTA-style cover art from your photos</title>
-<link rel="stylesheet" href="./style.css">
+<title>Leonida Cover Maker</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">
-    <h1 id="app-title">Leonida Cover Maker</h1>
-    <p>Your photos, a multi-panel poster, a sunset grade and bold lettering — exported as a PNG. Everything runs on your machine; photos are never uploaded.</p>
+<header class="masthead">
+  <div>
+    <h1>Leonida Cover Maker</h1>
+    <p class="tagline">Turn your own photos into a multi-panel neon poster cover. Everything runs on this machine: no uploads, no accounts.</p>
   </div>
-  <ol class="steps">
-    <li><strong>1</strong> Add photos</li>
-    <li><strong>2</strong> Layout &amp; grade</li>
-    <li><strong>3</strong> Write the caption</li>
-    <li><strong>4</strong> Export PNG</li>
-  </ol>
+  <p class="hint">Drop photos onto the cover, drag a panel to reframe it, pick a layout and a grade, then export a PNG.</p>
 </header>
-<div class="workspace">
-  <aside class="panel" id="photos-panel">
-    <h2>Photos &amp; panels</h2>
-    <div class="drop-zone" id="drop-zone" role="button" tabindex="0">
-      <p class="drop-title">Drop photos here</p>
-      <p class="drop-sub">or click to pick them from your machine</p>
-    </div>
-    <input id="photo-files" type="file" accept="image/*" multiple hidden>
-    <div class="photo-strip" id="photo-strip"></div>
-    <button class="ghost-button" id="add-samples" type="button">Add the demo photos again</button>
-    <fieldset class="fill-mode">
-      <legend>Fill the panels</legend>
-      <label><input type="radio" name="fill-mode" id="fill-multi" value="multi" checked> A photo per panel</label>
-      <label><input type="radio" name="fill-mode" id="fill-single" value="single"> One photo fills all panels</label>
+
+<main class="workspace">
+  <section class="stage" aria-label="Cover preview">
+    <canvas id="coverCanvas" width="864" height="1080"></canvas>
+    <p id="statusLine" class="status" role="status">Loading the sample photos…</p>
+  </section>
+
+  <aside class="controls" aria-label="Cover controls">
+    <fieldset>
+      <legend>1 · Photos</legend>
+      <label class="file-pick">
+        <span>Add photos from this machine</span>
+        <input id="photoInput" type="file" accept="image/*" multiple>
+      </label>
+      <div id="sampleRow" class="row"></div>
+      <label class="check">
+        <input id="singlePhoto" type="checkbox">
+        <span>One photo fills every panel</span>
+      </label>
+      <div id="panelChips" class="chips" aria-label="Panels"></div>
+      <label class="slider">
+        <span>Panel zoom</span>
+        <input id="zoomRange" type="range" min="1" max="3" step="0.01" value="1">
+      </label>
     </fieldset>
-    <h3>Panels</h3>
-    <div class="panel-chips" id="panel-chips"></div>
-    <label class="slider-row"><span id="zoom-label">Panel 1 zoom</span>
-      <input id="panel-zoom" type="range" min="1" max="3" step="0.01" value="1">
-    </label>
-    <p class="hint">Drag on the cover to position the photo; scroll to zoom.</p>
-    <div class="button-row">
-      <button class="ghost-button" id="panel-center" type="button">Centre</button>
-      <button class="ghost-button" id="panel-swap" type="button">Swap with next</button>
-      <button class="ghost-button" id="panel-clear" type="button">Clear</button>
-    </div>
+
+    <fieldset>
+      <legend>2 · Layout</legend>
+      <div id="layoutList" class="choices"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>3 · Colour grade</legend>
+      <div id="gradeList" class="choices compact"></div>
+      <label class="slider">
+        <span>Grade strength</span>
+        <input id="gradeStrength" type="range" min="0" max="1" step="0.01" value="0.85">
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>4 · Caption</legend>
+      <label class="text-field">
+        <span>Title</span>
+        <input id="titleInput" type="text" maxlength="26" value="LEONIDA NIGHTS">
+      </label>
+      <label class="text-field">
+        <span>Subtitle</span>
+        <input id="subtitleInput" type="text" maxlength="34" value="VICE DISTRICT DIARIES">
+      </label>
+      <label class="check">
+        <input id="decoSun" type="checkbox" checked>
+        <span>Sun disc</span>
+      </label>
+      <label class="check">
+        <input id="decoPalms" type="checkbox" checked>
+        <span>Palm silhouettes</span>
+      </label>
+      <label class="check">
+        <input id="decoSparkles" type="checkbox" checked>
+        <span>Sparkles</span>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>5 · Export PNG</legend>
+      <div id="exportRow" class="exports"></div>
+    </fieldset>
   </aside>
-  <main class="stage">
-    <canvas id="cover-canvas" width="1080" height="1350" aria-label="Your cover, live preview"></canvas>
-    <p class="stage-hint" id="stage-hint">The dashed outline is the panel you are editing.</p>
-  </main>
-  <aside class="panel" id="design-panel">
-    <h2>Layout</h2>
-    <div class="option-list" id="layout-buttons"></div>
-    <h2>Colour grade</h2>
-    <div class="option-list" id="grade-buttons"></div>
-    <label class="slider-row"><span>Grade intensity</span>
-      <input id="grade-intensity" type="range" min="0" max="1" step="0.01" value="0.85">
-    </label>
-    <h2>Caption</h2>
-    <label class="text-row">Title line 1 <input id="title-line-1" type="text" maxlength="18" value="LEONIDA"></label>
-    <label class="text-row">Title line 2 <input id="title-line-2" type="text" maxlength="18" value="NIGHTS"></label>
-    <label class="text-row">Subtitle <input id="subtitle" type="text" maxlength="34" value="A VICE BEACH STORY"></label>
-    <label class="slider-row"><span>Title size</span>
-      <input id="title-size" type="range" min="0.6" max="1.5" step="0.01" value="1">
-    </label>
-    <label class="slider-row"><span>Title tilt</span>
-      <input id="title-rotation" type="range" min="-8" max="8" step="0.5" value="-2">
-    </label>
-    <div class="swatch-row"><span>Title colour</span><div class="swatches" id="title-colors"></div></div>
-    <h2>Decorations</h2>
-    <label class="check-row"><input type="checkbox" id="deco-palms" checked> Palm silhouettes</label>
-    <label class="check-row"><input type="checkbox" id="deco-sun" checked> Retro sun disc</label>
-    <label class="check-row"><input type="checkbox" id="deco-sparkles" checked> Star sparkles</label>
-    <h2>Export</h2>
-    <label class="text-row">Post size
-      <select id="export-size"></select>
-    </label>
-    <button class="export-button" id="export-png" type="button">Export PNG</button>
-    <p class="status" id="status" role="status"></p>
-  </aside>
-</div>
-<script type="module" src="./src/main.js"></script>
+</main>
+
+<footer class="colophon">
+  <p>An original fan-made poster tool. Lettering is set in Anton (SIL Open Font License 1.1, bundled under <em>fonts/</em>). The sample photos were made with an image model and are free to use. Not affiliated with any game publisher.</p>
+</footer>
+
+<script type="module" src="src/main.js"></script>
 </body>
 </html>

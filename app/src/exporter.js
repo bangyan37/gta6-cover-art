@@ -1,51 +1,43 @@
-// Export: renders the cover once more, offscreen, at the exact post size the person picked, and hands it
-// back as a PNG. The bundled display font is awaited first, so the lettering in the file is the lettering
-// on the preview, never a fallback face.
+// PNG export for Leonida Cover Maker.
+//
+// A cover is exported by rendering the current state once more, at the
+// exact pixel size of the chosen post format, on an offscreen canvas and
+// saving that canvas as a PNG. The preview canvas is never scaled up, so
+// exports stay sharp whatever size the editor happens to be shown at.
 
-import { renderCover } from './cover.js';
-import { exportSizeById } from './state.js';
-import { TITLE_FONT_FAMILY } from './caption.js';
+import { renderCoverToCanvas } from './cover.js';
 
-/** Waits until the bundled Anton face is usable, so canvas text draws in it. */
-export async function ensureTitleFont() {
-  try {
-    await document.fonts.load(`64px ${TITLE_FONT_FAMILY}`);
-    await document.fonts.ready;
-  } catch {
-    // A font that failed to load leaves the fallback face; the cover still exports.
-  }
+// The three post sizes the bounty asks for, in the order the export
+// buttons show them.
+export const EXPORT_SIZES = [
+  { id: 'square', label: 'Square post', width: 1080, height: 1080 },
+  { id: 'portrait', label: 'Portrait post', width: 1080, height: 1350 },
+  { id: 'wide', label: 'Wide banner', width: 1920, height: 1080 },
+];
+
+export function exportSizeById(sizeId) {
+  return EXPORT_SIZES.find((size) => size.id === sizeId) ?? EXPORT_SIZES[0];
 }
 
-/** Renders the cover at an exact size onto a fresh canvas and returns it. */
-export async function renderCoverCanvas(state, width, height) {
-  await ensureTitleFont();
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  renderCover(canvas.getContext('2d'), width, height, state);
+// A file name for an export: the caption's first words, made file-safe,
+// plus the pixel size.
+export function exportFileName(state, size) {
+  const base = (state.title || 'leonida-cover')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'leonida-cover';
+  return `${base}-${size.width}x${size.height}.png`;
+}
+
+// Render and download one PNG at the requested size. Returns the canvas
+// it rendered, so callers (and the shot mode) can inspect the result.
+export function exportCoverPNG(state, library, size) {
+  const canvas = renderCoverToCanvas(state, library, size.width, size.height);
+  const link = document.createElement('a');
+  link.download = exportFileName(state, size);
+  link.href = canvas.toDataURL('image/png');
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
   return canvas;
-}
-
-/** The PNG blob of the cover at the state's chosen export size, and the file name to save it under. */
-export async function exportCoverPng(state) {
-  const size = exportSizeById(state.exportSizeId);
-  const canvas = await renderCoverCanvas(state, size.width, size.height);
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
-  return { blob, fileName: `leonida-cover-${size.width}x${size.height}.png`, width: size.width, height: size.height };
-}
-
-/** The cover at an exact size as a data URL (used by the screenshot scenes). */
-export async function exportCoverDataUrl(state, width, height) {
-  const canvas = await renderCoverCanvas(state, width, height);
-  return canvas.toDataURL('image/png');
-}
-
-/** Saves a blob as a downloaded file. */
-export function downloadBlob(blob, fileName) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = fileName;
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
 }

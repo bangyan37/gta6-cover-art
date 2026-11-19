@@ -1,158 +1,143 @@
-// The cover renderer: draws the whole poster onto a 2D context at any size — the panels with their
-// photos, the colour grade, the decorations, the panel borders and the caption. The editor's preview and
-// the exported PNG are this same drawing at different sizes, so what you see is what you share.
+// The cover render pipeline for Leonida Cover Maker.
+//
+// renderCover draws a complete cover into any 2D canvas at any size, in
+// this order:
+//   1. a photo layer: every panel's photo is cover-fitted into the
+//      panel's bounding box on an offscreen canvas, the whole layer is
+//      colour-graded in one pass, then each panel is clipped to its
+//      polygon and painted from the graded layer;
+//   2. the bright borders along every panel edge, plus a frame;
+//   3. the drawn decorations (sun, palms, sparkles);
+//   4. the caption block.
+// Grading the layer before clipping keeps the grade identical inside
+// every panel and leaves the lettering ungraded and crisp.
 
-import { layoutById, polygonBounds } from './layouts.js';
-import { gradeById, gradeFilter, paintGradeOverlay } from './grades.js';
-import { drawSunDisc, drawCornerPalms, drawSparkles } from './decorations.js';
+import { getLayout, panelBounds } from './layouts.js';
+import { getGrade, gradeImageData } from './grades.js';
+import { coverSourceRect } from './photos.js';
 import { drawCaption } from './caption.js';
+import { drawDecorations } from './decorations.js';
 
-/** Traces a unit-space polygon as a path on a w x h cover. */
-function tracePolygon(ctx, polygon, w, h) {
+export const BORDER_COLOUR = '#ffe9f4';
+export const BACKDROP_COLOUR = '#1b0f2e';
+
+function tracePanelPath(ctx, panel, width, height) {
   ctx.beginPath();
-  polygon.forEach(([x, y], i) => {
-    if (i === 0) ctx.moveTo(x * w, y * h);
-    else ctx.lineTo(x * w, y * h);
+  panel.forEach(([nx, ny], index) => {
+    const x = nx * width;
+    const y = ny * height;
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   });
   ctx.closePath();
 }
 
-/**
- * The draw rectangle for a photo covering a target box: cover-fit scale times the zoom, centred, then
- * shifted by the pan (pan is -1..1 across the spare room on each axis, so 0 is centred and the edges of
- * the photo never leave the box).
- */
-function coverFitRect(img, boxX, boxY, boxW, boxH, zoom, panX, panY) {
-  const scale = Math.max(boxW / img.naturalWidth, boxH / img.naturalHeight) * zoom;
-  const drawnW = img.naturalWidth * scale;
-  const drawnH = img.naturalHeight * scale;
-  const spareX = Math.max(0, drawnW - boxW) / 2;
-  const spareY = Math.max(0, drawnH - boxH) / 2;
-  return {
-    x: boxX + (boxW - drawnW) / 2 + panX * spareX,
-    y: boxY + (boxH - drawnH) / 2 + panY * spareY,
-    w: drawnW,
-    h: drawnH,
-  };
-}
+// Paint the graded photo layer: one offscreen canvas the size of the
+// cover, photos drawn panel by panel, graded once, returned ready to be
+// clipped from.
+function buildPhotoLayer(state, library, width, height) {
+  const layer = document.createElement('canvas');
+  layer.width = width;
+  layer.height = height;
+  const layerCtx = layer.getContext('2d');
+  layerCtx.fillStyle = BACKDROP_COLOUR;
+  layerCtx.fillRect(0, 0, width, height);
 
-/** Draws one panel's photo clipped inside its polygon, with the grade's filter applied. */
-function drawPanelPhoto(ctx, w, h, polygon, img, zoom, panX, panY, filter) {
-  const bounds = polygonBounds(polygon);
-  const rect = coverFitRect(
-    img,
-    bounds.minX * w, bounds.minY * h, bounds.width * w, bounds.height * h,
-    zoom, panX, panY,
-  );
-  ctx.save();
-  tracePolygon(ctx, polygon, w, h);
-  ctx.clip();
-  ctx.filter = filter;
-  ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h);
-  ctx.filter = 'none';
-  // A soft inner shadow along the panel's own edges, so neighbouring panels feel cut apart.
-  ctx.strokeStyle = 'rgba(10, 4, 20, 0.35)';
-  ctx.lineWidth = Math.max(6, w * 0.012);
-  ctx.stroke();
-  ctx.restore();
-}
-
-/** Draws one photo across the whole cover (single-photo mode), clipped to this panel. */
-function drawPanelFromWholeCover(ctx, w, h, polygon, img, zoom, panX, panY, filter) {
-  const rect = coverFitRect(img, 0, 0, w, h, zoom, panX, panY);
-  ctx.save();
-  tracePolygon(ctx, polygon, w, h);
-  ctx.clip();
-  ctx.filter = filter;
-  ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h);
-  ctx.filter = 'none';
-  ctx.strokeStyle = 'rgba(10, 4, 20, 0.35)';
-  ctx.lineWidth = Math.max(6, w * 0.012);
-  ctx.stroke();
-  ctx.restore();
-}
-
-/** An empty panel: a dusk gradient and a quiet prompt, so an unfinished cover still reads as a poster. */
-function drawEmptyPanel(ctx, w, h, polygon, index) {
-  const bounds = polygonBounds(polygon);
-  const gradient = ctx.createLinearGradient(bounds.minX * w, bounds.minY * h, bounds.maxX * w, bounds.maxY * h);
-  const hues = [[58, 28, 92], [122, 40, 92], [28, 60, 110], [150, 62, 52], [44, 90, 96], [96, 36, 120]];
-  const [r, g, b] = hues[index % hues.length];
-  gradient.addColorStop(0, `rgb(${r}, ${g}, ${b})`);
-  gradient.addColorStop(1, 'rgb(16, 8, 30)');
-  ctx.save();
-  tracePolygon(ctx, polygon, w, h);
-  ctx.clip();
-  ctx.fillStyle = gradient;
-  ctx.fillRect(bounds.minX * w, bounds.minY * h, bounds.width * w, bounds.height * h);
-  ctx.fillStyle = 'rgba(255, 235, 200, 0.5)';
-  ctx.font = `600 ${Math.round(Math.min(w, h) * 0.026)}px system-ui, sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.fillText('ADD A PHOTO', (bounds.minX + bounds.width / 2) * w, (bounds.minY + bounds.height / 2) * h);
-  ctx.restore();
-}
-
-/** The thin light seams between panels, and the poster's outer frame. */
-function drawPanelBorders(ctx, w, h, polygons) {
-  ctx.save();
-  ctx.strokeStyle = 'rgba(255, 244, 224, 0.92)';
-  ctx.lineWidth = Math.max(2, w * 0.0038);
-  ctx.lineJoin = 'round';
-  for (const polygon of polygons) {
-    tracePolygon(ctx, polygon, w, h);
-    ctx.stroke();
-  }
-  ctx.strokeStyle = 'rgba(16, 6, 30, 0.9)';
-  ctx.lineWidth = Math.max(3, w * 0.006);
-  ctx.strokeRect(0, 0, w, h);
-  ctx.strokeStyle = 'rgba(255, 244, 224, 0.92)';
-  ctx.lineWidth = Math.max(1.5, w * 0.0022);
-  const inset = Math.max(3, w * 0.006);
-  ctx.strokeRect(inset, inset, w - inset * 2, h - inset * 2);
-  ctx.restore();
-}
-
-/** Draws the selected panel's outline (editor only, never on an export). */
-export function drawSelectionOutline(ctx, w, h, polygon) {
-  ctx.save();
-  tracePolygon(ctx, polygon, w, h);
-  ctx.strokeStyle = '#22d3ee';
-  ctx.lineWidth = Math.max(3, w * 0.005);
-  ctx.setLineDash([Math.max(10, w * 0.02), Math.max(7, w * 0.013)]);
-  ctx.stroke();
-  ctx.restore();
-}
-
-/** Renders the state's cover onto ctx at w x h. */
-export function renderCover(ctx, w, h, state) {
-  const layout = layoutById(state.layoutId);
-  const grade = gradeById(state.gradeId);
-  const filter = gradeFilter(grade, state.gradeIntensity);
-  ctx.fillStyle = '#160a24';
-  ctx.fillRect(0, 0, w, h);
-  layout.panels.forEach((polygon, i) => {
-    if (state.fillMode === 'single') {
-      const img = state.photos[state.singlePhoto]?.img;
-      if (img) drawPanelFromWholeCover(ctx, w, h, polygon, img, state.singleZoom, state.singlePanX, state.singlePanY, filter);
-      else drawEmptyPanel(ctx, w, h, polygon, i);
+  const layout = getLayout(state.layoutId);
+  layout.panels.forEach((panel, index) => {
+    const slot = state.panels[index];
+    const photo = slot && slot.photoId ? library.get(slot.photoId) : null;
+    const bounds = panelBounds(panel);
+    const bx = bounds.minX * width;
+    const by = bounds.minY * height;
+    const bw = bounds.width * width;
+    const bh = bounds.height * height;
+    if (!photo) {
+      // An empty panel gets a dusk gradient placeholder in the panel's
+      // own hue family, so an unfinished cover still reads as a poster.
+      const hue = (index * 47) % 360;
+      const fill = layerCtx.createLinearGradient(bx, by, bx + bw, by + bh);
+      fill.addColorStop(0, `hsl(${hue}, 55%, 32%)`);
+      fill.addColorStop(1, `hsl(${(hue + 60) % 360}, 65%, 18%)`);
+      layerCtx.fillStyle = fill;
+      layerCtx.fillRect(bx, by, bw, bh);
       return;
     }
-    const photo = state.photos[state.panelPhoto[i]];
-    if (photo) {
-      drawPanelPhoto(ctx, w, h, polygon, photo.img, state.panelZoom[i], state.panelPanX[i], state.panelPanY[i], filter);
-    } else {
-      drawEmptyPanel(ctx, w, h, polygon, i);
-    }
+    const rect = coverSourceRect(photo.image, bw, bh, slot.zoom, slot.panX, slot.panY);
+    layerCtx.drawImage(photo.image, rect.sx, rect.sy, rect.sw, rect.sh, bx, by, bw, bh);
   });
-  if (state.showSun) drawSunDisc(ctx, w, h);
-  paintGradeOverlay(ctx, w, h, grade, state.gradeIntensity);
-  drawPanelBorders(ctx, w, h, layout.panels);
-  if (state.showPalms) drawCornerPalms(ctx, w, h);
-  if (state.showSparkles) drawSparkles(ctx, w, h);
-  drawCaption(ctx, w, h, state, layout.titleY);
+
+  const grade = getGrade(state.gradeId);
+  const imageData = layerCtx.getImageData(0, 0, width, height);
+  gradeImageData(imageData, grade, state.gradeStrength);
+  layerCtx.putImageData(imageData, 0, 0);
+  return layer;
 }
 
-/** Renders the cover onto a canvas at the canvas's own pixel size. */
-export function drawCover(canvas, state) {
-  renderCover(canvas.getContext('2d'), canvas.width, canvas.height, state);
+// Stroke every panel edge and the outer frame.
+function strokeBorders(ctx, layout, width, height) {
+  const border = Math.max(3, Math.round(Math.min(width, height) * 0.008));
+  ctx.save();
+  ctx.strokeStyle = BORDER_COLOUR;
+  ctx.lineWidth = border;
+  ctx.lineJoin = 'round';
+  for (const panel of layout.panels) {
+    tracePanelPath(ctx, panel, width, height);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#160a24';
+  ctx.lineWidth = border * 2.4;
+  ctx.strokeRect(0, 0, width, height);
+  ctx.strokeStyle = BORDER_COLOUR;
+  ctx.lineWidth = border;
+  ctx.strokeRect(border * 1.2, border * 1.2, width - border * 2.4, height - border * 2.4);
+  ctx.restore();
+}
+
+// A gentle vignette to seat the poster.
+function applyVignette(ctx, width, height) {
+  const radius = Math.max(width, height) * 0.75;
+  const gradient = ctx.createRadialGradient(
+    width / 2, height / 2, radius * 0.45,
+    width / 2, height / 2, radius,
+  );
+  gradient.addColorStop(0, 'rgba(8, 2, 18, 0)');
+  gradient.addColorStop(1, 'rgba(8, 2, 18, 0.38)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+}
+
+// Draw the full cover described by `state` into `canvas`, sized
+// canvas.width x canvas.height. `library` is a PhotoLibrary.
+export function renderCover(canvas, state, library) {
+  const width = canvas.width;
+  const height = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const layout = getLayout(state.layoutId);
+
+  const layer = buildPhotoLayer(state, library, width, height);
+  ctx.fillStyle = BACKDROP_COLOUR;
+  ctx.fillRect(0, 0, width, height);
+  for (const panel of layout.panels) {
+    ctx.save();
+    tracePanelPath(ctx, panel, width, height);
+    ctx.clip();
+    ctx.drawImage(layer, 0, 0);
+    ctx.restore();
+  }
+
+  strokeBorders(ctx, layout, width, height);
+  applyVignette(ctx, width, height);
+  drawDecorations(ctx, width, height, state.decorations);
+  drawCaption(ctx, width, height, state.title, state.subtitle);
+  return canvas;
+}
+
+// Render into a fresh offscreen canvas of an exact size; the exporter's
+// starting point and the shot mode's renderer.
+export function renderCoverToCanvas(state, library, width, height) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return renderCover(canvas, state, library);
 }
